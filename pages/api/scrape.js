@@ -1,6 +1,8 @@
 // pages/api/scrape.js
-// Accepts: { url: string }
-// Returns: { retailer: string, specs: { [label]: value } } or { error: string }
+
+export const config = {
+  maxDuration: 60, // Vercel max for hobby/pro plans
+}
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
@@ -27,23 +29,48 @@ export default async function handler(req, res) {
       body: JSON.stringify({
         url,
         formats: ['markdown'],
-        onlyMainContent: true,
+        onlyMainContent: false, // false = get full page, better for spec tables
+        waitFor: 3000, // wait 3s for JS to render
+        actions: [], // no actions needed
       }),
     })
 
     const fcData = await fcRes.json()
 
-    if (!fcData.success || !fcData.data?.markdown) {
-      return res.status(422).json({ error: 'Firecrawl could not fetch this page', detail: fcData.error || 'No content returned' })
+    // Log the raw Firecrawl response for debugging
+    console.log('Firecrawl response for', url, JSON.stringify({
+      success: fcData.success,
+      error: fcData.error,
+      hasMarkdown: !!fcData.data?.markdown,
+      markdownLength: fcData.data?.markdown?.length,
+    }))
+
+    if (!fcData.success) {
+      return res.status(422).json({
+        error: 'Firecrawl could not fetch this page',
+        detail: fcData.error || 'Unknown Firecrawl error',
+      })
     }
 
-    pageContent = fcData.data.markdown
+    // Try markdown first, fall back to html-derived content
+    pageContent = fcData.data?.markdown || fcData.data?.content || ''
+
+    if (!pageContent || pageContent.length < 100) {
+      return res.status(422).json({
+        error: 'Page returned no content — likely bot-protected',
+        detail: `Content length: ${pageContent.length}`,
+      })
+    }
+
   } catch (err) {
     return res.status(502).json({ error: 'Firecrawl request failed', detail: err.message })
   }
 
   // Step 2: Send page content to Claude to extract specs
   try {
+    // Send a larger chunk — 20k chars covers most spec pages
+    const contentSlice = pageContent.slice(0, 20000)
+
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -58,32 +85,58 @@ export default async function handler(req, res) {
           role: 'user',
           content: `You are extracting product specifications from a retailer product page.
 
-Below is the page content in markdown format. Extract ONLY the product specifications or tech specs table — the structured data about the product's physical and technical attributes.
+Below is the page content. Find the product specifications, tech specs, or product details section — the structured list of a product's technical and physical attributes.
 
-Return ONLY a JSON object where:
-- Keys are the exact spec labels as they appear on the page (do not rename or normalize)
-- Values are the exact spec values as they appear on the page
+Return ONLY a valid JSON object where:
+- Keys = exact spec labels as shown on the page
+- Values = exact spec values as shown on the page
 
-Example output: {"Brew Capacity (cups)": "12", "Wattage": "1500 W", "Water Tank Capacity": "60 oz"}
+Example: {"Brew Capacity": "12 cups", "Wattage": "1500W", "Dimensions": "14 x 8 x 12 in"}
 
-Do not include: product descriptions, marketing copy, reviews, price, availability, shipping info, or anything that is not a product specification.
-Return ONLY the JSON object, no other text, no markdown code fences.
+If you find NO specs at all, return exactly: {}
+
+Do not include: descriptions, marketing copy, reviews, prices, availability, shipping, or anything non-spec.
+Return ONLY the JSON object. No prose, no code fences, no explanation.
 
 PAGE CONTENT:
-${pageContent.slice(0, 12000)}`
+${contentSlice}`,
         }],
       }),
     })
 
     const claudeData = await claudeRes.json()
+
+    // Log Claude response for debugging
+    console.log('Claude response status:', claudeRes.status)
+    console.log('Claude content blocks:', claudeData.content?.map(b => b.type))
+
+    if (claudeRes.status !== 200) {
+      return res.status(502).json({
+        error: 'Claude API error',
+        detail: claudeData.error?.message || JSON.stringify(claudeData),
+      })
+    }
+
     const text = claudeData.content?.find(b => b.type === 'text')?.text || ''
-    const match = text.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/)
+    const cleaned = text.replace(/```json|```/g, '').trim()
+    const match = cleaned.match(/\{[\s\S]*\}/)
 
     if (!match) {
-      return res.status(422).json({ error: 'Could not extract specs from page content' })
+      return res.status(422).json({
+        error: 'Could not extract specs from page content',
+        detail: `Claude returned: ${text.slice(0, 200)}`,
+      })
     }
 
     const specs = JSON.parse(match[0])
+
+    if (Object.keys(specs).length === 0) {
+      return res.status(422).json({
+        error: 'No specs found on this page',
+        detail: 'Claude found no product specifications in the page content',
+      })
+    }
+
     return res.status(200).json({ specs })
 
   } catch (err) {

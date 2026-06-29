@@ -1,6 +1,8 @@
 // pages/api/build-matrix.js
-// Accepts: { category: string, retailerData: { [retailerName]: { [label]: value } } }
-// Returns: the full spec matrix JSON
+
+export const config = {
+  maxDuration: 60,
+}
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
@@ -34,18 +36,18 @@ ${JSON.stringify(retailerData, null, 2)}
 
 Match equivalent specs across retailers into rows, even when labels differ (e.g. "Brew Capacity (cups)" and "Number of Cups" are the same spec).
 
-Return ONLY a JSON object in this exact structure, no other text:
+Return ONLY a JSON object in this exact structure, no other text, no code fences:
 {
   "category": "${category}",
   "retailers": ${JSON.stringify(retailers)},
   "rows": [
     {
-      "concept": "what this spec measures (short, e.g. 'Cup capacity')",
+      "concept": "what this spec measures (short, e.g. Cup capacity)",
       "retailerSpecs": {
         "RetailerName": { "label": "exact label from that page", "value": "exact value from that page" }
       },
       "recommended": {
-        "label": "the best, clearest label from the actual retailer labels — not made up",
+        "label": "the best clearest label from the actual retailer labels",
         "value": "the most complete or precise value across all retailers, or null if values meaningfully differ"
       },
       "include": true
@@ -54,21 +56,35 @@ Return ONLY a JSON object in this exact structure, no other text:
 }
 
 Rules:
-- retailerSpecs: for each retailer key, include exact label + value if present, or set to null if that retailer does not have this spec
-- recommended.label: pick the clearest label from the actual retailer labels
-- recommended.value: pick the most informative value if they agree or are equivalent; null if they differ meaningfully
-- include: true for useful purchase-decision specs; false for model numbers, color variant names, marketing copy, warranty fine print
-- Sort rows: include:true first (ordered by how many retailers show that spec, most first); include:false at bottom
-- Return ONLY the JSON object, nothing else`
+- retailerSpecs: for EVERY retailer in ${JSON.stringify(retailers)}, include the entry if present, or set to null if that retailer does not have this spec
+- recommended.label: pick the clearest label from the actual retailer labels — do not invent new labels
+- recommended.value: pick the most informative value if they agree or are close equivalents; set to null if they meaningfully differ
+- include: true for useful purchase-decision specs; false for model numbers, SKUs, color variant names, marketing copy, warranty fine print
+- Sort rows: include=true first (most retailers → fewest); include=false at bottom
+- Return ONLY valid JSON, nothing else`,
         }],
       }),
     })
 
     const data = await claudeRes.json()
-    const text = data.content?.find(b => b.type === 'text')?.text || ''
-    const match = text.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/)
 
-    if (!match) return res.status(422).json({ error: 'Claude did not return valid JSON' })
+    if (claudeRes.status !== 200) {
+      return res.status(502).json({
+        error: 'Claude API error',
+        detail: data.error?.message || JSON.stringify(data),
+      })
+    }
+
+    const text = data.content?.find(b => b.type === 'text')?.text || ''
+    const cleaned = text.replace(/```json|```/g, '').trim()
+    const match = cleaned.match(/\{[\s\S]*\}/)
+
+    if (!match) {
+      return res.status(422).json({
+        error: 'Claude did not return valid JSON for the matrix',
+        detail: text.slice(0, 300),
+      })
+    }
 
     return res.status(200).json(JSON.parse(match[0]))
 
