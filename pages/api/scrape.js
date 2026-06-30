@@ -68,9 +68,21 @@ export default async function handler(req, res) {
 
   // Step 2: Send page content to Claude to extract specs
   try {
-    // Cap content size — markdown from heavy retail pages can be 150k+ chars,
-    // which bloats the request. 15k chars is plenty for a spec table.
-    let contentSlice = pageContent.slice(0, 15000)
+    // Specs are usually buried deep in the page (after nav, images, description, etc.)
+    // Taking the first N chars often misses them entirely. Instead, try to find
+    // a likely "specs" section and center our slice around it.
+    let contentSlice
+    const specKeywords = /specifications|tech specs|product details|product info|dimensions|what's included/i
+    const keywordMatch = pageContent.match(specKeywords)
+
+    if (keywordMatch && keywordMatch.index > 12000) {
+      // Found a specs-like heading deep in the page — grab a window around it
+      const start = Math.max(0, keywordMatch.index - 2000)
+      contentSlice = pageContent.slice(start, start + 18000)
+    } else {
+      // No clear marker, or it's near the top — just take a larger chunk from the start
+      contentSlice = pageContent.slice(0, 18000)
+    }
 
     // Strip characters that can break JSON string encoding in the request body
     contentSlice = contentSlice.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
@@ -130,6 +142,9 @@ ${contentSlice}`,
     const cleaned = text.replace(/```json|```/g, '').trim()
     const match = cleaned.match(/\{[\s\S]*\}/)
 
+    // Always log what Claude actually said — this is what was missing before
+    console.log('Claude raw text response (first 500 chars):', text.slice(0, 500))
+
     if (!match) {
       return res.status(422).json({
         error: 'Could not extract specs from page content',
@@ -140,6 +155,7 @@ ${contentSlice}`,
     const specs = JSON.parse(match[0])
 
     if (Object.keys(specs).length === 0) {
+      console.log('Claude found zero specs. Content sample sent (first 1000 chars):', contentSlice.slice(0, 1000))
       return res.status(422).json({
         error: 'No specs found on this page',
         detail: 'Claude found no product specifications in the page content',
