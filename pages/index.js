@@ -59,7 +59,7 @@ export default function Home() {
 
     const initial = {}
     urls.forEach(url => {
-      initial[url] = { name: getRetailerName(url), status: 'pending', specCount: 0, content: null, productName: null }
+      initial[url] = { name: getRetailerName(url), status: 'pending', specCount: 0, content: null, productName: null, image: null }
     })
     statusesRef.current = initial
     setStatuses({ ...initial })
@@ -74,7 +74,13 @@ export default function Home() {
         })
         const data = await res.json()
         if (!res.ok || data.error) throw new Error(data.error || 'Scrape failed')
-        updateStatus(url, { status: 'done', content: data.specs, specCount: Object.keys(data.specs).length, productName: data.productName })
+        updateStatus(url, {
+          status: 'done',
+          content: data.specs,
+          specCount: Object.keys(data.specs).length,
+          productName: data.productName,
+          image: data.image,
+        })
       } catch (e) {
         updateStatus(url, { status: 'error', error: e.message })
       }
@@ -100,8 +106,16 @@ export default function Home() {
     const products = successful.map(url => ({
       retailer: statusesRef.current[url].name,
       productName: statusesRef.current[url].productName,
+      image: statusesRef.current[url].image,
       url,
       specs: statusesRef.current[url].content,
+    }))
+
+    // Carry the failed retailers through too, so the user can see them in the table
+    const failed = urls.filter(u => !statusesRef.current[u].content).map(url => ({
+      retailer: statusesRef.current[url].name,
+      url,
+      error: statusesRef.current[url].error,
     }))
 
     try {
@@ -113,7 +127,7 @@ export default function Home() {
       clearInterval(ticker)
       const data = await res.json()
       if (!res.ok || data.error) throw new Error(data.error || 'Matrix build failed')
-      setMatrixData(data)
+      setMatrixData({ ...data, failed })
       setSynthesizing(false)
       setStep(3)
     } catch (e) {
@@ -157,7 +171,7 @@ export default function Home() {
       </Head>
 
       <div style={{ minHeight: '100vh', background: '#f7f8fa', padding: '2rem 1rem' }}>
-        <div style={{ maxWidth: 1100, margin: '0 auto' }}>
+        <div style={{ maxWidth: 1200, margin: '0 auto' }}>
 
           <div style={{ marginBottom: '2rem' }}>
             <h1 style={{ fontSize: 22, fontWeight: 700, color: '#111', marginBottom: 4 }}>Spec Matrix Builder</h1>
@@ -240,24 +254,29 @@ export default function Home() {
                   </div>
                 </div>
 
-                {/* Product header cards */}
-                <div style={{ display: 'grid', gridTemplateColumns: `repeat(${matrixData.products.length}, 1fr)`, gap: 10, marginBottom: 16 }}>
-                  {matrixData.products.map((p, i) => (
-                    <div key={i} style={{ background: '#f9fafb', border: '1px solid #e5e7eb', borderRadius: 8, padding: '10px 12px' }}>
-                      <div style={{ fontSize: 11, fontWeight: 700, color: '#3b82f6', textTransform: 'uppercase', letterSpacing: 0.4, marginBottom: 4 }}>{p.retailer}</div>
-                      <div style={{ fontSize: 12, color: '#111', fontWeight: 500, marginBottom: 6, lineHeight: 1.4 }}>{p.productName}</div>
-                      <a href={p.url} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: '#9ca3af', textDecoration: 'none', wordBreak: 'break-all' }}>View page ↗</a>
-                    </div>
-                  ))}
-                </div>
+                {matrixData.failed && matrixData.failed.length > 0 && (
+                  <div style={{ background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 8, padding: '10px 14px', marginBottom: 16, fontSize: 12, color: '#991b1b' }}>
+                    {matrixData.failed.map(f => `${f.retailer}: ${f.error}`).join(' · ')}
+                  </div>
+                )}
 
                 <div style={{ overflowX: 'auto' }}>
-                  <table style={{ borderCollapse: 'collapse', fontSize: 13, width: '100%', minWidth: 600 }}>
+                  <table style={{ borderCollapse: 'collapse', fontSize: 13, width: '100%', minWidth: 700 }}>
                     <thead>
+                      {/* Header row 1: retailer name + image + product name + link, all inside the table */}
                       <tr>
-                        <th style={th}>Spec</th>
-                        {matrixData.products.map(p => <th key={p.retailer} style={th}>{p.retailer}</th>)}
-                        <th style={{ ...th, background: '#eff6ff', color: '#1d4ed8' }}>Recommended</th>
+                        <th style={{ ...th, minWidth: 160 }}>Retailer</th>
+                        {matrixData.products.map(p => (
+                          <th key={p.retailer} style={{ ...th, minWidth: 160, verticalAlign: 'top', padding: '12px 14px' }}>
+                            <div style={{ fontSize: 12, fontWeight: 700, color: '#1d4ed8', textTransform: 'uppercase', letterSpacing: 0.4, marginBottom: 6 }}>{p.retailer}</div>
+                            {p.image && (
+                              <img src={p.image} alt={p.productName} style={{ width: 56, height: 56, objectFit: 'contain', background: '#fff', border: '1px solid #e5e7eb', borderRadius: 6, marginBottom: 6 }} />
+                            )}
+                            <div style={{ fontSize: 11, fontWeight: 500, color: '#111', lineHeight: 1.4, marginBottom: 6, whiteSpace: 'normal', maxWidth: 180 }}>{p.productName}</div>
+                            <a href={p.url} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: '#3b82f6', textDecoration: 'none', fontWeight: 500 }}>View page ↗</a>
+                          </th>
+                        ))}
+                        <th style={{ ...th, background: '#eff6ff', color: '#1d4ed8', minWidth: 160 }}>Recommended</th>
                       </tr>
                     </thead>
                     <tbody>

@@ -99,7 +99,19 @@ Rules:
       })
     }
 
-    return res.status(200).json(JSON.parse(match[0]))
+    const parsed = JSON.parse(match[0])
+
+    // Use the real product data we already have (url, image) rather than
+    // trusting Claude to echo it back correctly — avoids any chance of
+    // a dropped or altered image/url.
+    parsed.products = products.map(p => ({
+      retailer: p.retailer,
+      productName: p.productName,
+      url: p.url,
+      image: p.image || null,
+    }))
+
+    return res.status(200).json(parsed)
   } catch (err) {
     return res.status(502).json({ error: 'Matrix build failed', detail: err.message })
   }
