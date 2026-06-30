@@ -31,7 +31,7 @@ export default async function handler(req, res) {
         formats: ['markdown'],
         onlyMainContent: false, // false = get full page, better for spec tables
         waitFor: 3000, // wait 3s for JS to render
-        actions: [], // no actions needed
+        timeout: 45000, // 45s — retail pages with heavy JS need more than Firecrawl's default
       }),
     })
 
@@ -68,22 +68,19 @@ export default async function handler(req, res) {
 
   // Step 2: Send page content to Claude to extract specs
   try {
-    // Send a larger chunk — 20k chars covers most spec pages
-    const contentSlice = pageContent.slice(0, 20000)
+    // Cap content size — markdown from heavy retail pages can be 150k+ chars,
+    // which bloats the request. 15k chars is plenty for a spec table.
+    let contentSlice = pageContent.slice(0, 15000)
 
-    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 2000,
-        messages: [{
-          role: 'user',
-          content: `You are extracting product specifications from a retailer product page.
+    // Strip characters that can break JSON string encoding in the request body
+    contentSlice = contentSlice.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
+
+    const requestBody = {
+      model: 'claude-sonnet-4-6',
+      max_tokens: 2000,
+      messages: [{
+        role: 'user',
+        content: `You are extracting product specifications from a retailer product page.
 
 Below is the page content. Find the product specifications, tech specs, or product details section — the structured list of a product's technical and physical attributes.
 
@@ -100,20 +97,32 @@ Return ONLY the JSON object. No prose, no code fences, no explanation.
 
 PAGE CONTENT:
 ${contentSlice}`,
-        }],
-      }),
+      }],
+    }
+
+    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify(requestBody),
     })
 
     const claudeData = await claudeRes.json()
 
-    // Log Claude response for debugging
+    // Log full response details for debugging — this is the critical part
     console.log('Claude response status:', claudeRes.status)
-    console.log('Claude content blocks:', claudeData.content?.map(b => b.type))
+    if (claudeRes.status !== 200) {
+      console.log('Claude FULL error body:', JSON.stringify(claudeData))
+      console.log('Content length sent:', contentSlice.length)
+    }
 
     if (claudeRes.status !== 200) {
       return res.status(502).json({
         error: 'Claude API error',
-        detail: claudeData.error?.message || JSON.stringify(claudeData),
+        detail: claudeData.error?.message || claudeData.error?.type || JSON.stringify(claudeData).slice(0, 500),
       })
     }
 
