@@ -1,108 +1,72 @@
 // pages/api/scrape.js
-// Fetches a product page via Firecrawl, then extracts specs, product name,
-// and product image with Claude. Anti-hallucination: Claude only ever sees
-// real page text and is told to return {} rather than invent anything.
+//
+// REWRITTEN AFTER RESEARCH. Key findings that drove this rewrite:
+// 1. Firecrawl's `proxy: "auto"` mode automatically retries blocked/failed
+//    scrapes through a stronger stealth/residential-proxy backend. This was
+//    never set before, which is the real reason Best Buy kept failing —
+//    it was always using the weakest "basic" engine with no escalation.
+// 2. Firecrawl's native `formats: ["json"]` + `jsonOptions.schema` extracts
+//    structured data SERVER-SIDE with schema validation. This replaces our
+//    old approach of manually chunking raw markdown and asking Claude to
+//    find specs in each chunk via fragile regex-extracted JSON — which is
+//    exactly what caused the "Expected ',' or '}'" crash (unescaped quote
+//    marks in spec values like 12.13'' broke our hand-rolled JSON parsing).
+//    Firecrawl validates against the schema before ever returning data.
 
 export const config = {
   maxDuration: 60,
 }
 
-async function extractSpecsFromChunk(chunk, anthropicKey, chunkIndex) {
-  const requestBody = {
-    model: 'claude-sonnet-4-6',
-    max_tokens: 3000,
-    messages: [{
-      role: 'user',
-      content: `You are extracting product specifications from PART OF a retailer's product page (this may be a middle section, not the start).
+const SPEC_SCHEMA = {
+  type: 'object',
+  properties: {
+    productName: {
+      type: 'string',
+      description: 'The exact product title/name as shown on the page',
+    },
+    image: {
+      type: 'string',
+      description: 'The URL of the main product image on the page',
+    },
+    specs: {
+      type: 'array',
+      description: 'Every product specification found on the page — dimensions, weight, capacity, wattage, materials, color, model number, included accessories, certifications, etc. Extract every single spec row found, however many there are.',
+      items: {
+        type: 'object',
+        properties: {
+          label: { type: 'string', description: 'The exact spec label/name as written on the page' },
+          value: { type: 'string', description: 'The exact spec value as written on the page' },
+        },
+        required: ['label', 'value'],
+      },
+    },
+  },
+  required: ['specs'],
+}
 
-CRITICAL RULES:
-1. Only extract specs LITERALLY PRESENT in the text below. Never infer, guess, or fill in a spec that is not explicitly stated.
-2. Copy spec labels and values EXACTLY as written — no paraphrasing, no unit conversion, no reformatting.
-3. Do not use general product knowledge to invent "typical" specs. Only what is in this text counts.
-4. Look for ANY structured product attribute data: a specs table, "Product Details", "Dimensions", "What's Included", bullet lists of attributes (size, weight, capacity, wattage, voltage, materials, color, finish, model/SKU numbers, warranty length, certifications), even if scattered or informally formatted.
-5. If this section genuinely contains no such data, return exactly: {}
-
-Return ONLY a valid JSON object, labels as keys, values as values, copied verbatim.
-Example: {"Brew Capacity": "12 cups", "Wattage": "1500W"}
-Return ONLY the JSON object. No prose, no code fences.
-
-PAGE CONTENT (section ${chunkIndex}):
-${chunk}`,
-    }],
-  }
-
-  const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+async function scrapeWithFirecrawl(url, apiKey, proxyMode) {
+  const res = await fetch('https://api.firecrawl.dev/v1/scrape', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-api-key': anthropicKey,
-      'anthropic-version': '2023-06-01',
+      'Authorization': `Bearer ${apiKey}`,
     },
-    body: JSON.stringify(requestBody),
+    body: JSON.stringify({
+      url,
+      formats: ['json'],
+      onlyMainContent: false,
+      waitFor: 4000,
+      timeout: 55000,
+      proxy: proxyMode, // 'basic' first (cheap/fast), escalate to 'auto' on failure
+      jsonOptions: {
+        schema: SPEC_SCHEMA,
+        prompt: 'Extract the product name, main product image URL, and EVERY product specification listed on this retailer product page. Look in specifications tables, "Product Details" sections, "Tech Specs" sections, dimension lists, and feature bullet lists — specs are sometimes in a collapsed/tabbed section. Only extract specs that are literally present on the page. Do not infer, estimate, or add specs that are not explicitly shown. Copy every label and value exactly as written, with no paraphrasing or unit conversion.',
+      },
+    }),
   })
 
-  const claudeData = await claudeRes.json()
-
-  if (claudeRes.status !== 200) {
-    console.log(`Chunk ${chunkIndex} Claude error:`, JSON.stringify(claudeData).slice(0, 300))
-    return { error: claudeData.error?.message || claudeData.error?.type || 'Claude API error' }
-  }
-
-  const text = claudeData.content?.find(b => b.type === 'text')?.text || ''
-  const cleaned = text.replace(/```json|```/g, '').trim()
-  const match = cleaned.match(/\{[\s\S]*\}/)
-
-  if (!match) return { specs: {} }
-
-  try {
-    return { specs: JSON.parse(match[0]) }
-  } catch {
-    return { specs: {} }
-  }
-}
-
-async function extractMetadata(pageContent, anthropicKey) {
-  // Pull product name + a real image URL from the top of the page in one call
-  const topChunk = pageContent.slice(0, 6000)
-  const requestBody = {
-    model: 'claude-sonnet-4-6',
-    max_tokens: 400,
-    messages: [{
-      role: 'user',
-      content: `Below is the start of a retailer product page (markdown format, image links appear as ![alt](url)).
-
-Return ONLY a JSON object:
-{"productName": "exact product title from the page, or null if not found", "image": "the most likely main product image URL from the page (a real URL copied exactly from the text), or null if none found"}
-
-Pick an image URL that looks like a real product photo (not a logo, icon, or tracking pixel) — usually the first large image near the title. Return ONLY the JSON object, no other text.
-
-PAGE CONTENT:
-${topChunk}`,
-    }],
-  }
-
-  try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': anthropicKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify(requestBody),
-    })
-    const data = await res.json()
-    const text = data.content?.find(b => b.type === 'text')?.text || ''
-    const match = text.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/)
-    if (!match) return { productName: 'Unknown product', image: null }
-    const parsed = JSON.parse(match[0])
-    return {
-      productName: parsed.productName || 'Unknown product',
-      image: parsed.image || null,
-    }
-  } catch {
-    return { productName: 'Unknown product', image: null }
-  }
+  const data = await res.json()
+  return { httpStatus: res.status, data }
 }
 
 export default async function handler(req, res) {
@@ -112,130 +76,70 @@ export default async function handler(req, res) {
   if (!url) return res.status(400).json({ error: 'Missing url' })
 
   const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY
-  const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY
-
-  if (!FIRECRAWL_API_KEY || !ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: 'Missing API keys — check environment variables' })
+  if (!FIRECRAWL_API_KEY) {
+    return res.status(500).json({ error: 'Missing FIRECRAWL_API_KEY environment variable' })
   }
 
-  // Step 1: Fetch the page content via Firecrawl
-  let pageContent = ''
-  let ogImage = null
-  try {
-    const fcRes = await fetch('https://api.firecrawl.dev/v1/scrape', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${FIRECRAWL_API_KEY}`,
-      },
-      body: JSON.stringify({
-        url,
-        formats: ['markdown'],
-        onlyMainContent: false,
-        waitFor: 6000,
-        timeout: 60000,
-        mobile: false,
-        actions: [
-          { type: 'wait', milliseconds: 2000 },
-          // Many retailers (Best Buy especially) hide specs behind a
-          // collapsed "Specifications" tab/accordion that only loads
-          // into the DOM after a click. Scroll down to trigger lazy-load
-          // sections, since blind clicks on a selector that may not
-          // exist would fail the whole request.
-          { type: 'scroll', direction: 'down' },
-          { type: 'wait', milliseconds: 1500 },
-          { type: 'scroll', direction: 'down' },
-          { type: 'wait', milliseconds: 1500 },
-        ],
-      }),
-    })
+  // First attempt: basic proxy (fast, cheap — works for most sites: Wayfair,
+  // Target, AJ Madison, Lowe's all succeeded on basic in our testing).
+  let { httpStatus, data: fcData } = await scrapeWithFirecrawl(url, FIRECRAWL_API_KEY, 'basic')
 
-    const fcData = await fcRes.json()
+  console.log('Firecrawl basic attempt for', url, JSON.stringify({
+    httpStatus,
+    success: fcData.success,
+    error: fcData.error,
+    hasJson: !!fcData.data?.json,
+    specCount: fcData.data?.json?.specs?.length,
+  }))
 
-    console.log('Firecrawl response for', url, JSON.stringify({
+  // Escalate to auto (stealth/residential proxy retry) if basic failed.
+  // This is the documented fix for sites with aggressive bot detection
+  // like Best Buy, which blocks Firecrawl's default engine outright.
+  if (!fcData.success || !fcData.data?.json?.specs?.length) {
+    console.log('Basic proxy failed or found no specs, escalating to auto/stealth proxy for', url)
+    const retry = await scrapeWithFirecrawl(url, FIRECRAWL_API_KEY, 'auto')
+    httpStatus = retry.httpStatus
+    fcData = retry.data
+
+    console.log('Firecrawl auto/stealth attempt for', url, JSON.stringify({
+      httpStatus,
       success: fcData.success,
       error: fcData.error,
-      hasMarkdown: !!fcData.data?.markdown,
-      markdownLength: fcData.data?.markdown?.length,
+      hasJson: !!fcData.data?.json,
+      specCount: fcData.data?.json?.specs?.length,
     }))
-
-    if (!fcData.success) {
-      return res.status(422).json({
-        error: 'Firecrawl could not fetch this page',
-        detail: fcData.error || 'Unknown Firecrawl error',
-      })
-    }
-
-    pageContent = fcData.data?.markdown || fcData.data?.content || ''
-    // Firecrawl often returns og:image in metadata — reliable, real image
-    ogImage = fcData.data?.metadata?.ogImage || fcData.data?.metadata?.['og:image'] || null
-
-    if (!pageContent || pageContent.length < 100) {
-      return res.status(422).json({
-        error: 'Page returned no content — likely bot-protected',
-        detail: `Content length: ${pageContent.length}`,
-      })
-    }
-  } catch (err) {
-    return res.status(502).json({ error: 'Firecrawl request failed', detail: err.message })
   }
 
-  const cleanContent = pageContent.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
-
-  // Step 2: Extract product name + fallback image (only used if Firecrawl had no og:image)
-  const metadata = await extractMetadata(cleanContent, ANTHROPIC_API_KEY)
-  const finalImage = ogImage || metadata.image
-
-  // Step 3: Search the FULL page in overlapping chunks for specs.
-  // Increased chunk count + smaller chunks = more reliable on dense sites
-  // like Best Buy / Target where specs can be deeply nested or repeated
-  // amid huge amounts of unrelated content (reviews, recs, nav).
-  const CHUNK_SIZE = 25000
-  const OVERLAP = 2000
-  const MAX_SEARCH = 180000
-  const chunks = []
-  for (let i = 0; i < cleanContent.length && i < MAX_SEARCH; i += (CHUNK_SIZE - OVERLAP)) {
-    chunks.push(cleanContent.slice(i, i + CHUNK_SIZE))
-  }
-  if (chunks.length === 0) chunks.push(cleanContent)
-
-  console.log(`Searching ${chunks.length} chunk(s) for specs on ${url}, total content length ${cleanContent.length}`)
-
-  let mergedSpecs = {}
-  let lastError = null
-  let chunksChecked = 0
-
-  for (let i = 0; i < chunks.length; i++) {
-    const result = await extractSpecsFromChunk(chunks[i], ANTHROPIC_API_KEY, i + 1)
-    chunksChecked++
-    if (result.error) {
-      lastError = result.error
-      continue
-    }
-    const found = Object.keys(result.specs).length
-    console.log(`Chunk ${i + 1}/${chunks.length} on ${url}: found ${found} specs`)
-    mergedSpecs = { ...mergedSpecs, ...result.specs }
-
-    // Stop early once we have a strong result — saves time/cost
-    if (Object.keys(mergedSpecs).length >= 10) break
-  }
-
-  console.log(`Final result for ${url}: ${Object.keys(mergedSpecs).length} specs after checking ${chunksChecked} chunk(s)`)
-
-  if (Object.keys(mergedSpecs).length === 0) {
-    if (lastError) {
-      return res.status(502).json({ error: 'Claude API error', detail: lastError })
-    }
+  if (!fcData.success) {
     return res.status(422).json({
-      error: 'No specs found after searching the full page',
-      detail: `Checked ${chunksChecked} section(s) of ${cleanContent.length} total characters`,
+      error: 'Firecrawl could not fetch this page even with stealth proxy',
+      detail: fcData.error || 'Unknown Firecrawl error',
     })
   }
 
+  const json = fcData.data?.json
+  if (!json || !Array.isArray(json.specs) || json.specs.length === 0) {
+    return res.status(422).json({
+      error: 'No specs found on this page',
+      detail: 'Firecrawl scraped the page successfully but found no specification data — this retailer may not list specs for this product, or they are loaded in a way Firecrawl could not reach.',
+    })
+  }
+
+  // Convert the array of {label, value} into a plain object for easy
+  // merging/matrix-building downstream, while preserving order.
+  const specs = {}
+  for (const item of json.specs) {
+    if (item.label && item.value) {
+      specs[item.label] = item.value
+    }
+  }
+
+  const ogImage = fcData.data?.metadata?.ogImage || fcData.data?.metadata?.['og:image'] || null
+
   return res.status(200).json({
-    specs: mergedSpecs,
-    productName: metadata.productName,
-    image: finalImage,
+    specs,
+    productName: json.productName || 'Unknown product',
+    image: ogImage || json.image || null,
     sourceUrl: url,
   })
 }

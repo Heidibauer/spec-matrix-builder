@@ -1,18 +1,55 @@
 // pages/api/build-matrix.js
-// Builds the final spec matrix: one row per retailer/product (specs exactly as
-// scraped, verbatim), plus a final "Recommended" row that picks the best spec
-// set for buying decisions. No new specs are invented at this stage — this
-// step only organizes and selects from what scrape.js already extracted.
+//
+// REWRITTEN. The old version crashed because it extracted JSON from Claude's
+// raw text response using a regex (/\{[\s\S]*\}/), which breaks the instant
+// a spec value contains an unescaped quote mark (e.g. 12.13'' H X 9.33'' W —
+// literal double-prime/inch marks are extremely common in dimension specs
+// and are NOT valid inside a naive regex-matched JSON string).
+//
+// Fix: use Claude's native tool-use / structured output instead of asking
+// for "raw JSON text" and hoping it's parseable. We define a tool schema
+// and force Claude to call it — the Anthropic API enforces valid JSON
+// against the schema before we ever see it, eliminating this entire class
+// of parse failure.
 
 export const config = {
   maxDuration: 60,
+}
+
+const MATRIX_TOOL = {
+  name: 'build_spec_matrix',
+  description: 'Return the organized spec comparison matrix',
+  input_schema: {
+    type: 'object',
+    properties: {
+      specRows: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            concept: { type: 'string', description: 'Short label for what this spec measures, e.g. "Cup capacity"' },
+            valuesByRetailer: {
+              type: 'object',
+              description: 'Map of retailer name to "label: value" string, or null if that retailer does not have this spec',
+              additionalProperties: { type: ['string', 'null'] },
+            },
+            recommendedLabel: { type: 'string', description: 'The clearest actual label pulled from the real retailer data' },
+            recommendedValue: { type: ['string', 'null'], description: 'The best actual value copied from real data, or null if it varies meaningfully across retailers' },
+            buyingDecisionImportance: { type: 'string', enum: ['high', 'medium', 'low'] },
+            includeInRecommended: { type: 'boolean', description: 'false for model numbers, SKUs, color codes, marketing taglines; true for genuine purchase-decision specs' },
+          },
+          required: ['concept', 'valuesByRetailer', 'recommendedLabel', 'recommendedValue', 'buyingDecisionImportance', 'includeInRecommended'],
+        },
+      },
+    },
+    required: ['specRows'],
+  },
 }
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
   const { category, products } = req.body
-  // products = [{ retailer, url, productName, specs: {label: value} }, ...]
   if (!category || !products || !Array.isArray(products) || products.length === 0) {
     return res.status(400).json({ error: 'Missing category or products array' })
   }
@@ -31,53 +68,32 @@ export default async function handler(req, res) {
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
         max_tokens: 4000,
+        tools: [MATRIX_TOOL],
+        tool_choice: { type: 'tool', name: 'build_spec_matrix' },
         messages: [{
           role: 'user',
           content: `You are building a buying-decision spec comparison for "${category}" shoppers.
 
-Below are the RAW, VERBATIM specs already scraped from ${products.length} retailer product pages. These are real, already-extracted facts — your job here is NOT to find new specs, but to:
-1. Identify which spec concepts are the same across different products even when labeled differently (e.g. "Brew Capacity" and "Number of Cups" are the same concept)
-2. Group all specs into a consistent set of spec rows (columns in the final table) so they line up
-3. Build ONE recommended row that represents the best spec set a shopper should see to make a buying decision
+Below are RAW, VERBATIM specs already scraped from ${products.length} retailer product pages. These are real, already-extracted facts. Your job:
+1. Identify which spec concepts are the same across products even when labeled differently (e.g. "Brew Capacity" and "Number of Cups" are the same concept)
+2. Group all specs into a consistent set of spec rows so they line up across retailers
+3. Build one recommended label+value per row representing the best spec a shopper should see
 
 RAW DATA:
 ${JSON.stringify(products.map(p => ({
   retailer: p.retailer,
   productName: p.productName,
-  specs: Object.fromEntries(Object.entries(p.specs).slice(0, 40)), // cap to keep request fast
+  specs: Object.fromEntries(Object.entries(p.specs).slice(0, 40)),
 })), null, 2)}
 
 CRITICAL RULES:
-- NEVER invent a spec value. Every value in your output must be traceable to the raw data above, copied exactly.
-- Do not average, estimate, or merge differing values into a new number. If retailers disagree, only pick one of their actual stated values for the recommended row, or mark it as varies.
-- Use product knowledge ONLY to judge which spec concepts matter for buying decisions (e.g. brew capacity matters, color may not) — not to invent spec values.
+- NEVER invent a spec value. Every value must be traceable to the raw data above, copied exactly.
+- Do not average, estimate, or merge differing values into a new number. If retailers disagree, pick one of their actual stated values for the recommended row, or set recommendedValue to null.
+- Use product knowledge ONLY to judge which spec concepts matter for buying decisions — never to invent spec values.
+- valuesByRetailer must include an entry for every retailer: ${JSON.stringify(products.map(p => p.retailer))}. Use null where that retailer doesn't have the spec.
+- Sort specRows by buyingDecisionImportance (high → medium → low), then by how many retailers report that spec (most → fewest).
 
-Return ONLY a JSON object in this exact structure, no other text:
-{
-  "category": "${category}",
-  "products": [
-    { "retailer": "RetailerName", "productName": "exact product name", "url": "the url" }
-  ],
-  "specRows": [
-    {
-      "concept": "short label for what this spec measures, e.g. Cup capacity",
-      "valuesByRetailer": {
-        "RetailerName": "exact label: exact value" 
-      },
-      "recommendedLabel": "the clearest actual label to use in the database, pulled from the real data",
-      "recommendedValue": "the best actual value to show shoppers, copied from real data, or null if it meaningfully varies and there's no single best answer",
-      "buyingDecisionImportance": "high" | "medium" | "low",
-      "includeInRecommended": true
-    }
-  ]
-}
-
-Rules:
-- valuesByRetailer: for each retailer in the input, include their exact label+value as a single string "label: value" if they have this spec concept, or null if they don't have it at all
-- includeInRecommended: false for non-decision specs like model numbers, SKUs, color variant codes, marketing taglines; true for genuinely useful purchase-decision specs (capacity, dimensions, power, materials, included accessories, compatibility, etc)
-- buyingDecisionImportance: "high" for specs most shoppers check first (capacity, size, power, key features), "medium" for useful but secondary specs, "low" for minor details
-- Sort specRows by buyingDecisionImportance (high → medium → low), then by how many retailers report that spec (most → fewest)
-- Return ONLY valid JSON, nothing else`,
+Call the build_spec_matrix tool with your result.`,
         }],
       }),
     })
@@ -89,7 +105,7 @@ Rules:
       console.log('Claude response was not valid JSON. Status:', claudeRes.status, 'Parse error:', parseErr.message)
       return res.status(502).json({
         error: 'Claude API returned an unreadable response',
-        detail: `HTTP ${claudeRes.status}, parse error: ${parseErr.message}`,
+        detail: `HTTP ${claudeRes.status}: ${parseErr.message}`,
       })
     }
 
@@ -101,32 +117,32 @@ Rules:
       })
     }
 
-    const text = data.content?.find(b => b.type === 'text')?.text || ''
-    const cleaned = text.replace(/```json|```/g, '').trim()
-    const match = cleaned.match(/\{[\s\S]*\}/)
+    // Tool-use responses come back as a structured content block — no
+    // regex, no manual parsing, no chance of broken JSON from quote marks.
+    const toolUseBlock = data.content?.find(b => b.type === 'tool_use' && b.name === 'build_spec_matrix')
 
-    if (!match) {
+    if (!toolUseBlock || !toolUseBlock.input) {
+      console.log('No tool_use block found. Full response:', JSON.stringify(data).slice(0, 1000))
       return res.status(422).json({
-        error: 'Claude did not return valid JSON for the matrix',
-        detail: text.slice(0, 300),
+        error: 'Claude did not return a structured matrix',
+        detail: 'Expected a tool_use block but none was found in the response',
       })
     }
 
-    const parsed = JSON.parse(match[0])
+    const result = {
+      category,
+      products: products.map(p => ({
+        retailer: p.retailer,
+        productName: p.productName,
+        url: p.url,
+        image: p.image || null,
+      })),
+      specRows: toolUseBlock.input.specRows || [],
+    }
 
-    // Use the real product data we already have (url, image) rather than
-    // trusting Claude to echo it back correctly — avoids any chance of
-    // a dropped or altered image/url.
-    parsed.products = products.map(p => ({
-      retailer: p.retailer,
-      productName: p.productName,
-      url: p.url,
-      image: p.image || null,
-    }))
-
-    return res.status(200).json(parsed)
+    return res.status(200).json(result)
   } catch (err) {
     console.log('Matrix build exception:', err.message, err.stack)
-    return res.status(502).json({ error: 'Matrix build failed', detail: err.message || err.toString() || 'Unknown error' })
+    return res.status(502).json({ error: 'Matrix build failed', detail: err.message || 'Unknown error' })
   }
 }
