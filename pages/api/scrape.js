@@ -28,23 +28,25 @@
 
 export const config = { maxDuration: 60 }
 
+// [SC-FIX] Zyte customAttributes schema format is a flat map of
+// attribute_name → {type, description} — NOT a JSON Schema object wrapper.
+// The error "Format of field customAttributes.type is invalid" was caused
+// by passing {type:"object", properties:{specifications:[...]}} which is
+// the JSON Schema format, not what Zyte expects.
+// Correct format per docs: { "attr_name": { "type": "...", "description": "..." } }
+// We use a single "specifications" attribute of type array of objects.
 const SPEC_SCHEMA = {
-  type: 'object',
-  properties: {
-    specifications: {
-      type: 'array',
-      description: 'Every product specification listed on the page. Be exhaustive — typically 20-40 specs including dimensions, weight, capacity, wattage, voltage, materials, color, model number, certifications, included accessories, warranty, compatibility.',
-      items: {
-        type: 'object',
-        properties: {
-          label: { type: 'string', description: 'Exact spec label as written on the page' },
-          value: { type: 'string', description: 'Exact spec value as written on the page' },
-        },
-        required: ['label', 'value'],
+  specifications: {
+    type: 'array',
+    description: 'Every product specification listed on this page. Extract ALL of them — dimensions, weight, capacity, wattage, voltage, materials, color, model number, certifications, included accessories, warranty, compatibility. Typically 20-40 specs on a retail product page.',
+    items: {
+      type: 'object',
+      properties: {
+        label: { type: 'string', description: 'Exact spec label as written on the page' },
+        value: { type: 'string', description: 'Exact spec value as written on the page' },
       },
     },
   },
-  required: ['specifications'],
 }
 
 export default async function handler(req, res) {
@@ -75,10 +77,11 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         url,
-        product: true,                    // Built-in AI product extraction
-        customAttributes: SPEC_SCHEMA,    // Our spec extraction schema
+        product: true,
+        browserHtml: true,                // needed for Claude fallback if customAttributes finds 0 specs
+        customAttributes: SPEC_SCHEMA,
         productOptions: {
-          extractFrom: 'browserHtml',     // Use rendered browser HTML for JS-heavy pages
+          extractFrom: 'browserHtml',
         },
       }),
     })
@@ -98,7 +101,8 @@ export default async function handler(req, res) {
   }
 
   // [SC-3] Extract specs from Zyte's customAttributes response
-  const rawSpecs = zyteData.customAttributes?.specifications || []
+  // Per Zyte docs, values are under customAttributes.values, not customAttributes directly
+  const rawSpecs = zyteData.customAttributes?.values?.specifications || []
   const product = zyteData.product || {}
 
   console.log(`[SC-4] Zyte extracted: product name="${product.name}", ${rawSpecs.length} specs, image:${!!product.images?.[0]?.url}`)
