@@ -41,7 +41,11 @@ Below are the RAW, VERBATIM specs already scraped from ${products.length} retail
 3. Build ONE recommended row that represents the best spec set a shopper should see to make a buying decision
 
 RAW DATA:
-${JSON.stringify(products.map(p => ({ retailer: p.retailer, productName: p.productName, specs: p.specs })), null, 2)}
+${JSON.stringify(products.map(p => ({
+  retailer: p.retailer,
+  productName: p.productName,
+  specs: Object.fromEntries(Object.entries(p.specs).slice(0, 40)), // cap to keep request fast
+})), null, 2)}
 
 CRITICAL RULES:
 - NEVER invent a spec value. Every value in your output must be traceable to the raw data above, copied exactly.
@@ -78,7 +82,16 @@ Rules:
       }),
     })
 
-    const data = await claudeRes.json()
+    let data
+    try {
+      data = await claudeRes.json()
+    } catch (parseErr) {
+      console.log('Claude response was not valid JSON. Status:', claudeRes.status, 'Parse error:', parseErr.message)
+      return res.status(502).json({
+        error: 'Claude API returned an unreadable response',
+        detail: `HTTP ${claudeRes.status}, parse error: ${parseErr.message}`,
+      })
+    }
 
     if (claudeRes.status !== 200) {
       console.log('Claude matrix build error:', JSON.stringify(data))
@@ -113,6 +126,7 @@ Rules:
 
     return res.status(200).json(parsed)
   } catch (err) {
-    return res.status(502).json({ error: 'Matrix build failed', detail: err.message })
+    console.log('Matrix build exception:', err.message, err.stack)
+    return res.status(502).json({ error: 'Matrix build failed', detail: err.message || err.toString() || 'Unknown error' })
   }
 }

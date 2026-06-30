@@ -132,8 +132,21 @@ export default async function handler(req, res) {
         url,
         formats: ['markdown'],
         onlyMainContent: false,
-        waitFor: 4000,
-        timeout: 45000,
+        waitFor: 6000,
+        timeout: 60000,
+        mobile: false,
+        actions: [
+          { type: 'wait', milliseconds: 2000 },
+          // Many retailers (Best Buy especially) hide specs behind a
+          // collapsed "Specifications" tab/accordion that only loads
+          // into the DOM after a click. Scroll down to trigger lazy-load
+          // sections, since blind clicks on a selector that may not
+          // exist would fail the whole request.
+          { type: 'scroll', direction: 'down' },
+          { type: 'wait', milliseconds: 1500 },
+          { type: 'scroll', direction: 'down' },
+          { type: 'wait', milliseconds: 1500 },
+        ],
       }),
     })
 
