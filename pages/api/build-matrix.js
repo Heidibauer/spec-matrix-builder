@@ -1,23 +1,19 @@
-// pages/api/build-matrix.js
+// pages/api/build-matrix.js v8
 //
-// [BM-R1] Major rework based on feedback:
-//   - Recommended column was showing non-answers like "varies" — fixed by
-//     always requiring a real, concrete value choice from the actual data.
-//   - No category grouping/headers — added groupLabel per spec row so the
-//     frontend can render section headers (Capacity & Brewing, Dimensions,
-//     Power, etc).
-//   - Recommended specs weren't genuinely curated for buying decisions —
-//     prompt now explicitly frames this as "what would a shopper actually
-//     check before buying" and requires a one-line justification per
-//     recommended spec so the curation is auditable, not just a guess.
+// [BM-L1] Uses Claude tool-use (not raw text + regex) so the API validates
+//   JSON before we see it — eliminates parse crashes from spec values with
+//   quote marks like 12.13'' H X 9.33'' W.
+// [BM-L2] max_tokens raised to 8000 — earlier 4000 caused empty specRows
+//   when Claude's response got cut off mid-generation.
+// [BM-L3] recommendedSpecs is a flat list of curated specs with concrete
+//   values — never "varies", always a real value from one retailer.
+// [BM-L4] Each specRow has a groupLabel for section headers in the table.
 
-export const config = {
-  maxDuration: 60,
-}
+export const config = { maxDuration: 60 }
 
-const MATRIX_TOOL = {
-  name: 'build_spec_matrix',
-  description: 'Return the organized, grouped spec comparison matrix with curated buying-decision recommendations',
+const TOOL = {
+  name: 'build_matrix',
+  description: 'Build the spec comparison matrix',
   input_schema: {
     type: 'object',
     properties: {
@@ -26,30 +22,29 @@ const MATRIX_TOOL = {
         items: {
           type: 'object',
           properties: {
-            concept: { type: 'string', description: 'Short label for what this spec measures, e.g. "Cup capacity"' },
-            groupLabel: { type: 'string', description: 'Category this spec belongs to, e.g. "Capacity & Brewing", "Dimensions & Weight", "Power & Electrical", "Materials & Design", "Included Accessories", "Warranty & Certifications", "Other Features"' },
-            valuesByRetailer: {
+            concept:      { type: 'string', description: 'Short name for this spec concept, e.g. "Cup capacity"' },
+            group:        { type: 'string', description: 'Section this spec belongs to: "Capacity & Brewing", "Dimensions & Weight", "Power & Electrical", "Materials & Design", "Included Accessories", "Compatibility", "Warranty", or "Other"' },
+            byRetailer: {
               type: 'object',
-              description: 'Map of retailer name to the EXACT label+value from that retailer\'s page, formatted as "label: value". Use null if that retailer does not have this spec. NEVER normalize or rewrite — copy exactly as scraped.',
+              description: 'Exact "label: value" string from each retailer, verbatim. null if that retailer does not have this spec.',
               additionalProperties: { type: ['string', 'null'] },
             },
           },
-          required: ['concept', 'groupLabel', 'valuesByRetailer'],
+          required: ['concept', 'group', 'byRetailer'],
         },
       },
       recommendedSpecs: {
         type: 'array',
-        description: 'The curated final list of specs to show shoppers — the genuinely useful subset that helps someone decide whether to buy this product. NOT every spec from specRows. Think like a product page editor: what would a real shopper actually check?',
+        description: 'Curated list of 8-15 specs a shopper actually checks when buying this product. Must be genuinely useful for buying decisions.',
         items: {
           type: 'object',
           properties: {
-            label: { type: 'string', description: 'The clearest real label, pulled from actual retailer data' },
-            value: { type: 'string', description: 'A real, concrete value copied from one retailer\'s actual data. Never "varies" or any non-answer — always pick the most complete/precise real value available.' },
-            groupLabel: { type: 'string', description: 'Same category system as specRows' },
-            sourceRetailer: { type: 'string', description: 'Which retailer this value was copied from' },
-            whyItMatters: { type: 'string', description: 'One short phrase on why a shopper cares about this spec, e.g. "Determines how many cups before refilling"' },
+            label:          { type: 'string', description: 'Clearest real label from the retailer data' },
+            value:          { type: 'string', description: 'Concrete value from one specific retailer — never "varies", always real' },
+            group:          { type: 'string' },
+            fromRetailer:   { type: 'string', description: 'Which retailer this value came from' },
           },
-          required: ['label', 'value', 'groupLabel', 'sourceRetailer', 'whyItMatters'],
+          required: ['label', 'value', 'group', 'fromRetailer'],
         },
       },
     },
@@ -61,100 +56,81 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
   const { category, products } = req.body
-  if (!category || !products || !Array.isArray(products) || products.length === 0) {
-    return res.status(400).json({ error: 'Missing category or products array' })
+  if (!category || !Array.isArray(products) || !products.length) {
+    return res.status(400).json({ error: 'Missing category or products' })
   }
 
-  const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY
-  if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'Missing ANTHROPIC_API_KEY' })
+  const KEY = process.env.ANTHROPIC_API_KEY
+  if (!KEY) return res.status(500).json({ error: 'Missing ANTHROPIC_API_KEY' })
 
-  const SPECS_PER_PRODUCT_CAP = 50 // [BM-R2] raised since dual-pass scraping now finds more real specs
-  const trimmedProducts = products.map(p => ({
+  const retailers = products.map(p => p.retailer)
+  const trimmed = products.map(p => ({
     retailer: p.retailer,
     productName: p.productName,
-    specs: Object.fromEntries(Object.entries(p.specs).slice(0, SPECS_PER_PRODUCT_CAP)),
+    specs: Object.fromEntries(Object.entries(p.specs).slice(0, 50)),
   }))
 
-  const totalSpecsSent = trimmedProducts.reduce((sum, p) => sum + Object.keys(p.specs).length, 0)
-  console.log(`[BM-9] Building matrix for "${category}" — ${products.length} products, ${totalSpecsSent} total specs sent to Claude`)
+  console.log(`[BM-1] ${category} — ${products.length} products, ${trimmed.reduce((n, p) => n + Object.keys(p.specs).length, 0)} total specs`)
 
+  let claudeRes, data
   try {
-    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+    claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+      headers: { 'Content-Type': 'application/json', 'x-api-key': KEY, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
         max_tokens: 8000,
-        tools: [MATRIX_TOOL],
-        tool_choice: { type: 'tool', name: 'build_spec_matrix' },
+        tools: [TOOL],
+        tool_choice: { type: 'tool', name: 'build_matrix' },
         messages: [{
           role: 'user',
-          content: `You are organizing scraped product specs for a "${category}" buying guide, and separately curating a short list of the specs that actually matter for a buying decision.
+          content: `You are organizing verbatim product specs for a "${category}" buying comparison.
 
-RAW DATA — verbatim specs already scraped from ${trimmedProducts.length} retailer pages:
-${JSON.stringify(trimmedProducts, null, 2)}
+RAW SCRAPED DATA (${products.length} retailers):
+${JSON.stringify(trimmed, null, 2)}
 
-PART 1 — specRows (the full reference matrix):
-- Match equivalent spec concepts across retailers even when labeled differently (e.g. "Brew Capacity" and "Number of Cups" are the same concept)
-- For each concept, include every retailer's EXACT label and value, verbatim, never normalized or reworded. Format as "label: value" (e.g. "Capacity: 66 oz"). Use null where a retailer doesn't have it.
-- Assign each row a groupLabel category: "Capacity & Brewing", "Dimensions & Weight", "Power & Electrical", "Materials & Design", "Included Accessories", "Warranty & Certifications", or "Other Features" (use whichever categories make sense for ${category} — adapt names if needed for this product type).
-- valuesByRetailer must have a key for every retailer: ${JSON.stringify(trimmedProducts.map(p => p.retailer))}.
+TASK 1 — specRows: Match equivalent specs across retailers into rows even when labels differ. For each row:
+- concept: short clear label for what this spec measures
+- group: one of "Capacity & Brewing", "Dimensions & Weight", "Power & Electrical", "Materials & Design", "Included Accessories", "Compatibility", "Warranty", "Other"
+- byRetailer: for EVERY retailer in ${JSON.stringify(retailers)}, include their exact "label: value" string, or null if absent
 
-PART 2 — recommendedSpecs (the curated shopper-facing list):
-Think like an experienced e-commerce merchandiser writing the "Specifications" box that actually ships on a product page. A shopper deciding whether to buy this ${category} checks maybe 8-15 specs, not 40. Select ONLY those — the ones that actually drive a purchase decision (capacity/size, power, key dimensions, standout features, what's included, compatibility, warranty length). Skip SKUs, model numbers, color-only variants, and minor details no one checks.
+TASK 2 — recommendedSpecs: Pick 8-15 specs a shopper genuinely checks before buying a ${category}. For each:
+- Use a real, concrete value copied from one specific retailer
+- Never write "varies" — always pick the most complete/precise real value
+- Note which retailer it came from
 
-CRITICAL RULES:
-- NEVER invent a value. Every value in both sections must be traceable to the raw data above, copied exactly.
-- recommendedSpecs.value must ALWAYS be a real, concrete value from one specific retailer — never "varies", never blank, never a vague placeholder. If retailers disagree on a value, just pick the clearest/most complete one and cite which retailer it came from in sourceRetailer.
-- Do not pad recommendedSpecs to hit a count — only include genuinely decision-relevant specs, even if that's only 8-10 for this product.
+RULES:
+- Never invent values. Every value must come verbatim from the raw data above.
+- byRetailer must have a key for every retailer: ${JSON.stringify(retailers)}
 
-Call the build_spec_matrix tool with your result.`,
+Call the build_matrix tool.`,
         }],
       }),
     })
-
-    let data
-    try {
-      data = await claudeRes.json()
-    } catch (parseErr) {
-      console.log('[BM-11] Claude response was not valid JSON. Status:', claudeRes.status, parseErr.message)
-      return res.status(502).json({ error: 'Claude API returned an unreadable response', detail: `HTTP ${claudeRes.status}` })
-    }
-
-    if (claudeRes.status !== 200) {
-      console.log('[BM-12] Claude matrix build error:', JSON.stringify(data))
-      return res.status(502).json({ error: 'Claude API error', detail: data.error?.message || JSON.stringify(data).slice(0, 500) })
-    }
-
-    console.log('[BM-14] stop_reason:', data.stop_reason, '| usage:', JSON.stringify(data.usage))
-
-    const toolUseBlock = data.content?.find(b => b.type === 'tool_use' && b.name === 'build_spec_matrix')
-    if (!toolUseBlock) {
-      console.log('[BM-15] No tool_use block. content types:', JSON.stringify(data.content?.map(b => b.type)))
-      return res.status(422).json({ error: 'Claude did not return a structured matrix', detail: `stop_reason: ${data.stop_reason}` })
-    }
-
-    const specRows = toolUseBlock.input?.specRows
-    const recommendedSpecs = toolUseBlock.input?.recommendedSpecs
-
-    console.log(`[BM-17] specRows: ${specRows?.length ?? 'n/a'}, recommendedSpecs: ${recommendedSpecs?.length ?? 'n/a'}`)
-
-    if (!specRows || !Array.isArray(specRows) || specRows.length === 0) {
-      console.log('[BM-19] specRows empty. Raw input:', JSON.stringify(toolUseBlock.input).slice(0, 1500))
-      return res.status(422).json({ error: 'Claude returned an empty spec matrix', detail: `stop_reason: ${data.stop_reason}` })
-    }
-
-    const result = {
-      category,
-      products: products.map(p => ({ retailer: p.retailer, productName: p.productName, url: p.url, image: p.image || null })),
-      specRows,
-      recommendedSpecs: recommendedSpecs || [],
-    }
-
-    console.log(`[BM-20] Success: ${specRows.length} spec rows, ${result.recommendedSpecs.length} recommended specs`)
-    return res.status(200).json(result)
+    data = await claudeRes.json()
   } catch (err) {
-    console.log('[BM-21] Matrix build exception:', err.message, err.stack)
-    return res.status(502).json({ error: 'Matrix build failed', detail: err.message || 'Unknown error' })
+    return res.status(502).json({ error: 'Claude request failed', detail: err.message })
   }
+
+  if (claudeRes.status !== 200) {
+    console.log('[BM-2] Claude error:', JSON.stringify(data).slice(0, 500))
+    return res.status(502).json({ error: 'Claude API error', detail: data.error?.message })
+  }
+
+  console.log(`[BM-3] stop_reason:${data.stop_reason} output_tokens:${data.usage?.output_tokens}`)
+
+  const block = data.content?.find(b => b.type === 'tool_use' && b.name === 'build_matrix')
+  if (!block?.input?.specRows?.length) {
+    console.log('[BM-4] No specRows. content:', JSON.stringify(data.content?.map(b => b.type)))
+    return res.status(422).json({ error: 'Claude returned empty matrix', detail: `stop_reason: ${data.stop_reason}` })
+  }
+
+  console.log(`[BM-5] specRows:${block.input.specRows.length} recommended:${block.input.recommendedSpecs?.length}`)
+
+  return res.status(200).json({
+    category,
+    products: products.map(p => ({ retailer: p.retailer, productName: p.productName, url: p.url, image: p.image || null })),
+    specRows: block.input.specRows,
+    recommendedSpecs: block.input.recommendedSpecs || [],
+  })
 }
