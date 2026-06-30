@@ -98,7 +98,7 @@ export default async function handler(req, res) {
   const FIRECRAWL_TIMEOUT_MS = 48000 // leaves headroom inside Vercel's 60s limit
   let { httpStatus, data: fcData } = await scrapeWithFirecrawl(url, FIRECRAWL_API_KEY, 'auto', FIRECRAWL_TIMEOUT_MS)
 
-  console.log('Firecrawl auto-proxy attempt for', url, JSON.stringify({
+  console.log('[SC-1] Firecrawl auto-proxy attempt for', url, JSON.stringify({
     httpStatus,
     success: fcData.success,
     error: fcData.error,
@@ -115,6 +115,7 @@ export default async function handler(req, res) {
 
   const json = fcData.data?.json
   if (!json || !Array.isArray(json.specs) || json.specs.length === 0) {
+    console.log('[SC-2] No specs in Firecrawl response for', url)
     return res.status(422).json({
       error: 'No specs found on this page',
       detail: 'Firecrawl scraped the page successfully but found no specification data — this retailer may not list specs for this product, or they are loaded in a way Firecrawl could not reach.',
