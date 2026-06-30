@@ -38,6 +38,7 @@ export default function Home() {
   const [synthesizing, setSynthesizing] = useState(false)
   const [copied, setCopied] = useState(false)
   const [fatalError, setFatalError] = useState('')
+  const [showAllSpecs, setShowAllSpecs] = useState(false)
   const statusesRef = useRef({})
 
   function addUrl() { setUrlInputs(p => [...p, '']) }
@@ -72,7 +73,12 @@ export default function Home() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url }),
         })
-        const data = await res.json()
+        let data
+        try {
+          data = await res.json()
+        } catch {
+          throw new Error(`Server returned an unreadable response (HTTP ${res.status}) — likely a timeout`)
+        }
         if (!res.ok || data.error) throw new Error(data.error || 'Scrape failed')
         updateStatus(url, {
           status: 'done',
@@ -260,32 +266,45 @@ export default function Home() {
                   </div>
                 )}
 
-                <div style={{ overflowX: 'auto' }}>
-                  <table style={{ borderCollapse: 'collapse', fontSize: 13, width: '100%', minWidth: 700 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+                  <button
+                    onClick={() => setShowAllSpecs(s => !s)}
+                    style={{ ...ghostBtn, background: showAllSpecs ? '#fff' : '#eff6ff', borderColor: showAllSpecs ? '#e5e7eb' : '#bfdbfe', color: showAllSpecs ? '#374151' : '#1d4ed8' }}
+                  >
+                    {showAllSpecs ? 'Showing all specs' : 'Showing high/medium only'}
+                  </button>
+                  <span style={{ fontSize: 12, color: '#9ca3af' }}>
+                    {matrixData.specRows.filter(r => showAllSpecs || r.buyingDecisionImportance !== 'low').length} of {matrixData.specRows.length} specs shown
+                  </span>
+                </div>
+
+                <div style={{ overflowX: 'auto', border: '1px solid #e5e7eb', borderRadius: 10 }}>
+                  <table style={{ borderCollapse: 'collapse', fontSize: 12.5, width: '100%' }}>
                     <thead>
-                      {/* Header row 1: retailer name + image + product name + link, all inside the table */}
                       <tr>
-                        <th style={{ ...th, minWidth: 160 }}>Retailer</th>
+                        <th style={{ ...th, position: 'sticky', left: 0, zIndex: 2, minWidth: 130, maxWidth: 130 }}>Spec</th>
                         {matrixData.products.map(p => (
-                          <th key={p.retailer} style={{ ...th, minWidth: 160, verticalAlign: 'top', padding: '12px 14px' }}>
-                            <div style={{ fontSize: 12, fontWeight: 700, color: '#1d4ed8', textTransform: 'uppercase', letterSpacing: 0.4, marginBottom: 6 }}>{p.retailer}</div>
-                            {p.image && (
-                              <img src={p.image} alt={p.productName} style={{ width: 56, height: 56, objectFit: 'contain', background: '#fff', border: '1px solid #e5e7eb', borderRadius: 6, marginBottom: 6 }} />
-                            )}
-                            <div style={{ fontSize: 11, fontWeight: 500, color: '#111', lineHeight: 1.4, marginBottom: 6, whiteSpace: 'normal', maxWidth: 180 }}>{p.productName}</div>
-                            <a href={p.url} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: '#3b82f6', textDecoration: 'none', fontWeight: 500 }}>View page ↗</a>
+                          <th key={p.retailer} style={{ ...th, minWidth: 140, maxWidth: 150, verticalAlign: 'top', padding: '10px 12px' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                              {p.image && (
+                                <img src={p.image} alt={p.productName} style={{ width: 32, height: 32, objectFit: 'contain', background: '#fff', border: '1px solid #e5e7eb', borderRadius: 5, flexShrink: 0 }} />
+                              )}
+                              <div style={{ fontSize: 11, fontWeight: 700, color: '#1d4ed8', textTransform: 'uppercase', letterSpacing: 0.3 }}>{p.retailer}</div>
+                            </div>
+                            <div style={{ fontSize: 10.5, fontWeight: 500, color: '#374151', lineHeight: 1.35, marginBottom: 4, whiteSpace: 'normal', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{p.productName}</div>
+                            <a href={p.url} target="_blank" rel="noreferrer" style={{ fontSize: 10.5, color: '#3b82f6', textDecoration: 'none', fontWeight: 500 }}>View page ↗</a>
                           </th>
                         ))}
-                        <th style={{ ...th, background: '#eff6ff', color: '#1d4ed8', minWidth: 160 }}>Recommended</th>
+                        <th style={{ ...th, background: '#eff6ff', color: '#1d4ed8', minWidth: 140, maxWidth: 150 }}>Recommended</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {matrixData.specRows.map((row, i) => (
+                      {matrixData.specRows.filter(r => showAllSpecs || r.buyingDecisionImportance !== 'low').map((row, i) => (
                         <tr key={i} style={{ background: i % 2 === 0 ? '#fff' : '#f9fafb' }}>
-                          <td style={{ ...td, fontWeight: 500 }}>
-                            <div>{row.concept}</div>
+                          <td style={{ ...td, fontWeight: 500, position: 'sticky', left: 0, background: i % 2 === 0 ? '#fff' : '#f9fafb', zIndex: 1, maxWidth: 130 }}>
+                            <div style={{ lineHeight: 1.3 }}>{row.concept}</div>
                             {row.buyingDecisionImportance && (
-                              <span style={{ fontSize: 10, color: importanceColor[row.buyingDecisionImportance], fontWeight: 600, textTransform: 'uppercase' }}>
+                              <span style={{ fontSize: 9.5, color: importanceColor[row.buyingDecisionImportance], fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.3 }}>
                                 {row.buyingDecisionImportance}
                               </span>
                             )}
@@ -293,15 +312,15 @@ export default function Home() {
                           {matrixData.products.map(p => {
                             const val = row.valuesByRetailer?.[p.retailer]
                             return (
-                              <td key={p.retailer} style={td}>
+                              <td key={p.retailer} style={{ ...td, maxWidth: 150 }}>
                                 {val ? <span style={{ color: '#111' }}>{val}</span> : <span style={{ color: '#d1d5db' }}>—</span>}
                               </td>
                             )
                           })}
-                          <td style={{ ...td, background: row.includeInRecommended ? '#eff6ff' : '#fafafa' }}>
+                          <td style={{ ...td, background: row.includeInRecommended ? '#eff6ff' : '#fafafa', maxWidth: 150 }}>
                             {row.includeInRecommended ? (
                               <>
-                                <span style={{ fontSize: 11, color: '#3b82f6', display: 'block', marginBottom: 2 }}>{row.recommendedLabel}</span>
+                                <span style={{ fontSize: 10, color: '#3b82f6', display: 'block', marginBottom: 2 }}>{row.recommendedLabel}</span>
                                 <span style={{ color: '#1d4ed8', fontWeight: 500 }}>
                                   {row.recommendedValue !== null ? row.recommendedValue : <span style={{ opacity: 0.5, fontWeight: 400, fontStyle: 'italic' }}>varies</span>}
                                 </span>
@@ -340,5 +359,5 @@ function Field({ label, children, style }) {
 
 const primaryBtn = { padding: '10px 20px', background: '#1d4ed8', color: '#fff', border: 'none', borderRadius: 7, fontSize: 14, fontWeight: 500, cursor: 'pointer' }
 const ghostBtn = { padding: '7px 14px', background: '#fff', border: '1px solid #e5e7eb', borderRadius: 7, fontSize: 13, color: '#374151', cursor: 'pointer' }
-const th = { textAlign: 'left', padding: '10px 14px', borderBottom: '1.5px solid #e5e7eb', fontSize: 12, color: '#6b7280', fontWeight: 600, whiteSpace: 'nowrap', background: '#f9fafb' }
-const td = { padding: '10px 14px', borderBottom: '1px solid #f3f4f6', verticalAlign: 'top', fontSize: 13 }
+const th = { textAlign: 'left', padding: '10px 12px', borderBottom: '1.5px solid #e5e7eb', fontSize: 11, color: '#6b7280', fontWeight: 600, background: '#f9fafb' }
+const td = { padding: '9px 12px', borderBottom: '1px solid #f3f4f6', verticalAlign: 'top', fontSize: 12.5, lineHeight: 1.4, wordBreak: 'break-word' }

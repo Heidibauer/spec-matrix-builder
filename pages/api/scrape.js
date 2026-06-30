@@ -44,7 +44,7 @@ const SPEC_SCHEMA = {
   required: ['specs'],
 }
 
-async function scrapeWithFirecrawl(url, apiKey, proxyMode) {
+async function scrapeWithFirecrawl(url, apiKey, proxyMode, timeoutMs) {
   const res = await fetch('https://api.firecrawl.dev/v1/scrape', {
     method: 'POST',
     headers: {
@@ -55,9 +55,9 @@ async function scrapeWithFirecrawl(url, apiKey, proxyMode) {
       url,
       formats: ['json'],
       onlyMainContent: false,
-      waitFor: 4000,
-      timeout: 55000,
-      proxy: proxyMode, // 'basic' first (cheap/fast), escalate to 'auto' on failure
+      waitFor: 3000,
+      timeout: timeoutMs,
+      proxy: proxyMode,
       jsonOptions: {
         schema: SPEC_SCHEMA,
         prompt: 'Extract the product name, main product image URL, and EVERY product specification listed on this retailer product page. Look in specifications tables, "Product Details" sections, "Tech Specs" sections, dimension lists, and feature bullet lists — specs are sometimes in a collapsed/tabbed section. Only extract specs that are literally present on the page. Do not infer, estimate, or add specs that are not explicitly shown. Copy every label and value exactly as written, with no paraphrasing or unit conversion.',
@@ -65,7 +65,15 @@ async function scrapeWithFirecrawl(url, apiKey, proxyMode) {
     }),
   })
 
-  const data = await res.json()
+  let data
+  try {
+    data = await res.json()
+  } catch (parseErr) {
+    // Vercel/Firecrawl returned something that isn't JSON at all (e.g. a
+    // gateway timeout error page). Treat this as a clean failure instead
+    // of crashing — this is what caused "Unexpected token 'A'" before.
+    return { httpStatus: res.status, data: { success: false, error: `Non-JSON response (HTTP ${res.status})` } }
+  }
   return { httpStatus: res.status, data }
 }
 
@@ -80,35 +88,23 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: 'Missing FIRECRAWL_API_KEY environment variable' })
   }
 
-  // First attempt: basic proxy (fast, cheap — works for most sites: Wayfair,
-  // Target, AJ Madison, Lowe's all succeeded on basic in our testing).
-  let { httpStatus, data: fcData } = await scrapeWithFirecrawl(url, FIRECRAWL_API_KEY, 'basic')
+  // IMPORTANT: only ONE Firecrawl call per request. Firecrawl's "auto" proxy
+  // mode already retries internally with stealth proxies if basic fails —
+  // we don't need to orchestrate that ourselves. Doing two sequential
+  // attempts from our side caused two ~55s calls to stack up and blow
+  // through Vercel's 60s function ceiling, which is what broke Wayfair/
+  // Best Buy last time (the function got killed mid-flight and the
+  // frontend received Vercel's own timeout error page instead of JSON).
+  const FIRECRAWL_TIMEOUT_MS = 48000 // leaves headroom inside Vercel's 60s limit
+  let { httpStatus, data: fcData } = await scrapeWithFirecrawl(url, FIRECRAWL_API_KEY, 'auto', FIRECRAWL_TIMEOUT_MS)
 
-  console.log('Firecrawl basic attempt for', url, JSON.stringify({
+  console.log('Firecrawl auto-proxy attempt for', url, JSON.stringify({
     httpStatus,
     success: fcData.success,
     error: fcData.error,
     hasJson: !!fcData.data?.json,
     specCount: fcData.data?.json?.specs?.length,
   }))
-
-  // Escalate to auto (stealth/residential proxy retry) if basic failed.
-  // This is the documented fix for sites with aggressive bot detection
-  // like Best Buy, which blocks Firecrawl's default engine outright.
-  if (!fcData.success || !fcData.data?.json?.specs?.length) {
-    console.log('Basic proxy failed or found no specs, escalating to auto/stealth proxy for', url)
-    const retry = await scrapeWithFirecrawl(url, FIRECRAWL_API_KEY, 'auto')
-    httpStatus = retry.httpStatus
-    fcData = retry.data
-
-    console.log('Firecrawl auto/stealth attempt for', url, JSON.stringify({
-      httpStatus,
-      success: fcData.success,
-      error: fcData.error,
-      hasJson: !!fcData.data?.json,
-      specCount: fcData.data?.json?.specs?.length,
-    }))
-  }
 
   if (!fcData.success) {
     return res.status(422).json({
