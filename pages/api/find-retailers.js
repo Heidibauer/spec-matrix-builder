@@ -84,31 +84,46 @@ export default async function handler(req, res) {
     const results = data.shopping || []
     console.log(`[FR3] Got ${results.length} shopping results`)
 
+    // Log first 3 results to see exact field names and values
+    if (results.length > 0) {
+      console.log('[FR3a] Sample results:', JSON.stringify(results.slice(0, 3).map(r => ({
+        title: r.title?.slice(0, 50),
+        source: r.source,
+        link: r.link?.slice(0, 80),
+        price: r.price,
+      }))))
+    }
+
     // Pick one product URL per target retailer
     const found = {}
 
     for (const item of results) {
-      // Serper shopping results have: title, source, link, price, imageUrl
       const rawLink = item.link || ''
-      const source  = (item.source || '').toLowerCase()
+      const source  = (item.source || '').toLowerCase().replace(/\s+/g, '').replace(/\./g, '')
       const directUrl = extractDirectUrl(rawLink) || rawLink
 
       for (const domain of targetRetailers) {
         if (found[domain]) continue
 
-        const domainBase = domain.replace('.com', '')
-        if (directUrl.includes(domain) || source.includes(domainBase) || source.replace(/\s+/g,'').toLowerCase().includes(domainBase)) {
-          // Skip search pages, non-product pages, used/refurbished
+        // Match more broadly — Serper source might be "Wayfair", "Best Buy", "AJ Madison" etc.
+        const domainBase = domain.replace('.com', '').replace(/\./g, '').toLowerCase()
+
+        const urlMatch    = directUrl.toLowerCase().includes(domain)
+        const sourceMatch = source.includes(domainBase) || domainBase.includes(source.slice(0, 4))
+
+        if (urlMatch || sourceMatch) {
           if (directUrl.includes('/search') || directUrl.includes('/s?') || directUrl.includes('?k=')) continue
           if ((item.condition || '').toLowerCase().includes('used')) continue
           if ((item.condition || '').toLowerCase().includes('refurb')) continue
+
+          console.log(`[FR3b] Matched ${domain} via source="${item.source}" url="${directUrl.slice(0, 60)}"`)
 
           found[domain] = {
             retailer: item.source || (domainBase.charAt(0).toUpperCase() + domainBase.slice(1)),
             url: directUrl,
             title: item.title,
             price: item.price,
-            thumbnail: item.imageUrl || item.thumbnailUrl || null,
+            thumbnail: item.imageUrl || item.thumbnailUrl || item.thumbnail || null,
           }
         }
       }
