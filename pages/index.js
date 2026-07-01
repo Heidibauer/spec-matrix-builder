@@ -58,14 +58,14 @@ export default function Home() {
 
   function copyCSV() {
     if (!schema) return
-    const rows = [['Group', 'Spec', 'Importance', 'Why It Matters']]
+    const rows = [['Category', 'Spec', 'Importance', 'Why It Matters']]
     for (const g of schema.groups) {
       for (const s of g.specs) {
         rows.push([g.name, s.label, s.importance, s.why])
       }
     }
-    const csv = rows.map(r => r.map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',')).join('\n')
-    navigator.clipboard.writeText(csv).then(() => flash('CSV copied!'))
+    const csv = rows.map(r => r.map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join('\t')).join('\n')
+    navigator.clipboard.writeText(csv).then(() => flash('Copied! Paste directly into Excel.'))
   }
 
   const totalSpecs = schema?.groups?.reduce((n, g) => n + g.specs.length, 0) ?? 0
@@ -179,7 +179,7 @@ export default function Home() {
               </div>
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                 {notice && <span style={{ fontSize: 12, color: '#10b981', fontWeight: 500 }}>{notice}</span>}
-                <button onClick={copyCSV}  style={ghostBtn}>Copy CSV</button>
+                <button onClick={copyCSV}  style={ghostBtn}>Copy for Excel</button>
                 <button onClick={copyJSON} style={ghostBtn}>Copy JSON</button>
               </div>
             </div>
