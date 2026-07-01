@@ -202,7 +202,7 @@ export default function App() {
                       <span style={{ minWidth: 110, fontSize: 13, fontWeight: 500, color: '#374151' }}>{s.name}</span>
                       <span style={{ fontSize: 12, color: s.status === 'done' ? '#10b981' : s.status === 'error' ? '#ef4444' : '#9ca3af' }}>
                         {s.status === 'pending' && 'Waiting…'}
-                        {s.status === 'loading' && 'Fetching…'}
+                        {s.status === 'loading' && 'Fetching & extracting… (up to 2 min)'}
                         {s.status === 'done'    && `${s.count} specs found`}
                         {s.status === 'error'   && (s.error || 'Failed')}
                       </span>

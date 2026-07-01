@@ -1,45 +1,124 @@
-// pages/api/scrape.js v10
+// pages/api/scrape.js v13
 //
-// FIXES FROM LOGS:
-// [v9-fix-1] Removed browserHtml:true from the Zyte request. Requesting
-//   full rendered HTML alongside product+customAttributes AI extraction
-//   caused 504 Vercel timeouts on Target (91k) and Wayfair (148-158k)
-//   pages — Zyte had to render + return massive HTML + run LLM extraction
-//   all within 60s. Dropping browserHtml cuts response time in half.
-//   Claude fallback is removed too since we can't get the HTML fast enough
-//   to use it within budget. Zyte's own extraction is sufficient.
+// KEY FIX: maxDuration raised to 300 (5 minutes).
+// Vercel Pro supports up to 900s for serverless functions.
+// This eliminates the 60s timeout that was killing Target/Wayfair requests.
 //
-// [v9-fix-2] Best Buy returns Zyte 520 "Website Ban" — even Zyte's top-tier
-//   anti-bot can't guarantee a clean response for Best Buy consistently.
-//   This is a known hard target. We surface a clear error with guidance
-//   rather than hanging. Users should try alternative URLs for Best Buy
-//   (e.g. a specific product model with a simpler URL, or use a different
-//   retailer like B&H Photo, Crutchfield, or Costco instead).
-//
-// [v9-fix-3] Set a hard 50s timeout on the Node fetch call itself so we
-//   always return before Vercel's 60s ceiling even if Zyte is slow.
+// With more time available:
+// - Zyte uses browserHtml (fully JS-rendered DOM, not raw HTML)
+// - Zyte uses actions to scroll + click "Show more specs" buttons
+//   before capturing — this is why Target was returning 8 specs instead of 20+
+// - Claude gets the full rendered text and extracts everything
+// - If spec count is still low after first attempt, we do a targeted
+//   second pass focused on the specs section specifically
 
-export const config = { maxDuration: 60 }
+export const config = { maxDuration: 300 }
 
-const SPEC_SCHEMA = {
-  specifications: {
-    type: 'array',
-    description: 'Every product specification on this retailer product page. Extract ALL of them — dimensions, weight, capacity, wattage, voltage, materials, color, model number, certifications, included accessories, warranty, compatibility. Typically 20-40 specs on a retail product page.',
-    items: {
-      type: 'object',
-      properties: {
-        label: { type: 'string', description: 'Exact spec label as written on the page' },
-        value: { type: 'string', description: 'Exact spec value as written on the page' },
-      },
-    },
-  },
+function b64(s) { return Buffer.from(s).toString('base64') }
+
+function fetchWithTimeout(url, opts, ms) {
+  const ctrl = new AbortController()
+  const t = setTimeout(() => ctrl.abort(), ms)
+  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(t))
 }
 
-function fetchWithTimeout(url, options, timeoutMs) {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
-  return fetch(url, { ...options, signal: controller.signal })
-    .finally(() => clearTimeout(timer))
+async function zyteGet(url, zyteKey, actions = []) {
+  const body = {
+    url,
+    browserHtml: true,
+    actions: [
+      { type: 'waitForTimeout', timeout: 3000 },
+      { type: 'scrollBottom' },
+      { type: 'waitForTimeout', timeout: 2000 },
+      ...actions,
+    ],
+  }
+
+  const res = await fetchWithTimeout(
+    'https://api.zyte.com/v1/extract',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Basic ' + b64(zyteKey + ':'),
+      },
+      body: JSON.stringify(body),
+    },
+    90000 // 90s for Zyte — plenty of room within 300s limit
+  )
+
+  const data = await res.json()
+  return { status: res.status, html: data.browserHtml || null, error: data.detail || data.title }
+}
+
+async function claudeExtract(text, anthropicKey) {
+  const res = await fetchWithTimeout(
+    'https://api.anthropic.com/v1/messages',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': anthropicKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 4000,
+        tools: [{
+          name: 'extract_product_data',
+          description: 'Extract product name and all specifications from a retailer page',
+          input_schema: {
+            type: 'object',
+            properties: {
+              productName: {
+                type: 'string',
+                description: 'The exact product title as shown on the page',
+              },
+              specs: {
+                type: 'array',
+                description: 'EVERY product specification on this page. Be exhaustive — dimensions, weight, capacity, wattage, voltage, materials, color, model number, certifications, included accessories, warranty, compatibility. Retail pages typically have 15-40 specs. Look in spec tables, "Product Details", "Tech Specs", "Specifications" sections, dimension charts, and feature bullet lists.',
+                items: {
+                  type: 'object',
+                  properties: {
+                    label: { type: 'string', description: 'Exact spec label as written on the page' },
+                    value: { type: 'string', description: 'Exact spec value as written on the page' },
+                  },
+                  required: ['label', 'value'],
+                },
+              },
+            },
+            required: ['productName', 'specs'],
+          },
+        }],
+        tool_choice: { type: 'tool', name: 'extract_product_data' },
+        messages: [{
+          role: 'user',
+          content: `Extract the product name and EVERY product specification from this retailer page. Only include specs literally present — never invent or infer. Be exhaustive.
+
+PAGE TEXT:
+${text}`,
+        }],
+      }),
+    },
+    45000 // 45s for Claude
+  )
+
+  const data = await res.json()
+  const block = data.content?.find(b => b.type === 'tool_use' && b.name === 'extract_product_data')
+  return block?.input || null
+}
+
+function htmlToText(html) {
+  return html
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
 export default async function handler(req, res) {
@@ -48,77 +127,91 @@ export default async function handler(req, res) {
   const { url } = req.body
   if (!url) return res.status(400).json({ error: 'Missing url' })
 
-  const ZYTE_API_KEY = process.env.ZYTE_API_KEY
-  if (!ZYTE_API_KEY) {
-    return res.status(500).json({
-      error: 'Missing ZYTE_API_KEY',
-      detail: 'Add ZYTE_API_KEY to Vercel environment variables. Get a key at https://app.zyte.com ($5 free trial).',
-    })
-  }
+  const ZYTE_KEY = process.env.ZYTE_API_KEY
+  const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY
 
-  let zyteRes, zyteData
-  try {
-    // [v9-fix-3] Hard 50s timeout — always returns before Vercel kills us at 60s
-    zyteRes = await fetchWithTimeout(
-      'https://api.zyte.com/v1/extract',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Basic ' + Buffer.from(ZYTE_API_KEY + ':').toString('base64'),
-        },
-        body: JSON.stringify({
-          url,
-          product: true,
-          customAttributes: SPEC_SCHEMA,
-          // [v9-fix-1] No browserHtml — cuts response time for large pages
-          productOptions: { extractFrom: 'browserHtml' },
-        }),
-      },
-      50000
-    )
-    zyteData = await zyteRes.json()
-  } catch (err) {
-    const isTimeout = err.name === 'AbortError'
-    return res.status(isTimeout ? 408 : 502).json({
-      error: isTimeout ? 'Zyte request timed out (page took too long to render)' : 'Zyte request failed',
-      detail: err.message,
-    })
-  }
+  if (!ZYTE_KEY) return res.status(500).json({ error: 'Missing ZYTE_API_KEY' })
+  if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'Missing ANTHROPIC_API_KEY' })
 
-  console.log(`[SC-1] ${url} — Zyte HTTP ${zyteRes.status}, specs:${zyteData.customAttributes?.values?.specifications?.length ?? 0}`)
+  // Pass 1: Get fully rendered page, scroll to bottom to trigger lazy loads
+  console.log(`[SC-1] Fetching ${url} via Zyte browserHtml + scroll`)
+  const pass1 = await zyteGet(url, ZYTE_KEY)
 
-  if (zyteRes.status !== 200) {
-    const isBan = zyteRes.status === 520
-    console.log(`[SC-2] Zyte error: ${JSON.stringify(zyteData).slice(0, 400)}`)
+  if (pass1.status === 520) {
     return res.status(422).json({
-      error: isBan
-        ? 'This retailer actively blocks all scrapers (including Zyte). Try a different URL or retailer.'
-        : 'Zyte could not fetch this page',
-      detail: zyteData.detail || JSON.stringify(zyteData).slice(0, 200),
+      error: 'This site blocks automated access. Try a different retailer.',
+      detail: pass1.error,
     })
   }
 
-  const rawSpecs = zyteData.customAttributes?.values?.specifications || []
-  const product = zyteData.product || {}
+  if (pass1.status !== 200 || !pass1.html) {
+    return res.status(422).json({
+      error: 'Could not fetch this page',
+      detail: pass1.error || `HTTP ${pass1.status}`,
+    })
+  }
 
-  console.log(`[SC-3] Product: "${product.name}", specs found: ${rawSpecs.length}`)
+  console.log(`[SC-2] Pass 1 HTML length: ${pass1.html.length}`)
 
-  if (rawSpecs.length === 0) {
+  // Extract from pass 1
+  const text1 = htmlToText(pass1.html).slice(0, 50000)
+  const result1 = await claudeExtract(text1, ANTHROPIC_KEY)
+
+  console.log(`[SC-3] Pass 1 specs: ${result1?.specs?.length ?? 0}`)
+
+  // Pass 2: If we got fewer than 12 specs, try clicking spec sections
+  // Many sites (Target, Best Buy) hide specs behind tabs/accordions
+  let result = result1
+  if ((result1?.specs?.length ?? 0) < 12) {
+    console.log(`[SC-4] Low spec count — running pass 2 with click actions`)
+    const pass2 = await zyteGet(url, ZYTE_KEY, [
+      // Click common "Specifications" tab/section selectors used by major retailers
+      { type: 'click', selector: { type: 'css', value: '[data-test="specifications-tab"]' } },
+      { type: 'waitForTimeout', timeout: 1500 },
+      { type: 'click', selector: { type: 'css', value: 'button[aria-label*="spec" i]' } },
+      { type: 'waitForTimeout', timeout: 1500 },
+      { type: 'click', selector: { type: 'css', value: '[class*="spec"][class*="tab" i]' } },
+      { type: 'waitForTimeout', timeout: 1500 },
+      { type: 'click', selector: { type: 'css', value: '[class*="specification"]' } },
+      { type: 'waitForTimeout', timeout: 1500 },
+      { type: 'click', selector: { type: 'css', value: 'a[href*="spec"]' } },
+      { type: 'waitForTimeout', timeout: 1500 },
+    ])
+
+    if (pass2.status === 200 && pass2.html) {
+      console.log(`[SC-5] Pass 2 HTML length: ${pass2.html.length}`)
+      const text2 = htmlToText(pass2.html).slice(0, 50000)
+      const result2 = await claudeExtract(text2, ANTHROPIC_KEY)
+      console.log(`[SC-6] Pass 2 specs: ${result2?.specs?.length ?? 0}`)
+
+      // Use whichever pass found more specs
+      if ((result2?.specs?.length ?? 0) > (result1?.specs?.length ?? 0)) {
+        result = result2
+        console.log(`[SC-7] Using pass 2 result (more specs)`)
+      }
+    }
+  }
+
+  if (!result?.specs?.length) {
     return res.status(422).json({
       error: 'No specs found on this page',
-      detail: 'Zyte fetched the page but found no product specifications.',
+      detail: 'The page loaded but contained no product specifications.',
     })
   }
 
   const specs = {}
-  for (const { label, value } of rawSpecs) {
+  for (const { label, value } of result.specs) {
     if (label && value) specs[label.trim()] = value.trim()
   }
 
+  const ogImageMatch = pass1.html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)
+    || pass1.html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i)
+
+  console.log(`[SC-8] Final: ${Object.keys(specs).length} specs for "${result.productName}"`)
+
   return res.status(200).json({
     specs,
-    productName: product.name || 'Unknown product',
-    image: product.images?.[0]?.url || null,
+    productName: result.productName || 'Unknown product',
+    image: ogImageMatch?.[1] || null,
   })
 }
