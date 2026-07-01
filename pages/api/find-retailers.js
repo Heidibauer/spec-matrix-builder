@@ -1,18 +1,18 @@
 // pages/api/find-retailers.js
-// Uses SerpApi Google Shopping to find real product URLs from top retailers
-// for a given category. Returns up to 8 retailer URLs with direct links.
+// Uses Serper.dev Google Shopping to find real product URLs from top retailers.
+// Serper returns Google redirect URLs, so we extract the actual retailer URL
+// from the redirect's ?q= parameter.
 
 export const config = { maxDuration: 30 }
 
-// Retailers to target per category type — Claude picks the right ones
 const RETAILER_TIERS = {
-  appliance:  ['wayfair.com', 'ajmadison.com', 'bestbuy.com', 'homedepot.com', 'lowes.com', 'costco.com', 'target.com'],
-  electronics:['bestbuy.com', 'target.com', 'costco.com', 'bhphotovideo.com', 'amazon.com', 'walmart.com', 'crutchfield.com'],
-  outdoor:    ['rei.com', 'backcountry.com', 'evo.com', 'dickssportinggoods.com', 'moosejaw.com', 'target.com'],
-  golf:       ['golfgalaxy.com', 'pgatoursuperstore.com', 'dickssportinggoods.com', 'callaway.com', 'amazon.com'],
-  furniture:  ['wayfair.com', 'target.com', 'westelm.com', 'crateandbarrel.com', 'cb2.com', 'potterybarn.com'],
-  fashion:    ['target.com', 'nordstrom.com', 'zappos.com', 'macys.com', 'amazon.com'],
-  default:    ['wayfair.com', 'target.com', 'bestbuy.com', 'amazon.com', 'walmart.com', 'costco.com', 'homedepot.com'],
+  appliance:   ['wayfair.com','ajmadison.com','bestbuy.com','homedepot.com','lowes.com','costco.com','target.com'],
+  electronics: ['bestbuy.com','target.com','costco.com','bhphotovideo.com','walmart.com','crutchfield.com','amazon.com'],
+  outdoor:     ['rei.com','backcountry.com','evo.com','dickssportinggoods.com','moosejaw.com','target.com','amazon.com'],
+  golf:        ['golfgalaxy.com','pgatoursuperstore.com','dickssportinggoods.com','callaway.com','amazon.com','2ndswing.com'],
+  furniture:   ['wayfair.com','target.com','westelm.com','crateandbarrel.com','potterybarn.com','article.com'],
+  fashion:     ['target.com','nordstrom.com','zappos.com','macys.com','amazon.com','dickssportinggoods.com'],
+  default:     ['wayfair.com','target.com','bestbuy.com','walmart.com','costco.com','homedepot.com','amazon.com'],
 }
 
 function getCategoryType(category) {
@@ -26,80 +26,103 @@ function getCategoryType(category) {
   return 'default'
 }
 
+// Serper returns Google redirect URLs like /url?q=https://wayfair.com/...
+// This extracts the real retailer URL from the redirect
+function extractDirectUrl(serperLink) {
+  if (!serperLink) return null
+  try {
+    // Handle /url?q=https://... format
+    if (serperLink.includes('/url?')) {
+      const u = new URL('https://google.com' + serperLink)
+      const q = u.searchParams.get('q')
+      if (q && q.startsWith('http')) return q
+    }
+    // Handle full URLs that are already direct
+    if (serperLink.startsWith('http')) return serperLink
+    return null
+  } catch {
+    return null
+  }
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
   const { category } = req.body
   if (!category) return res.status(400).json({ error: 'Missing category' })
 
-  const SERP_KEY = process.env.SERPAPI_KEY
-  if (!SERP_KEY) return res.status(500).json({ error: 'Missing SERPAPI_KEY — add it to Vercel environment variables' })
+  const SERPER_KEY = process.env.SERPER_API_KEY
+  if (!SERPER_KEY) return res.status(500).json({ error: 'Missing SERPER_API_KEY — add it to Vercel environment variables' })
 
   const categoryType = getCategoryType(category)
   const targetRetailers = RETAILER_TIERS[categoryType]
 
-  console.log(`[FR1] Searching for "${category}" (type: ${categoryType}) across ${targetRetailers.length} retailers`)
+  console.log(`[FR1] Searching for "${category}" (type: ${categoryType})`)
 
   try {
-    // Single Google Shopping search — returns results from many retailers at once
-    const params = new URLSearchParams({
-      engine: 'google_shopping',
-      q: category,
-      gl: 'us',
-      hl: 'en',
-      num: '40',  // Get enough results to find multiple retailers
-      api_key: SERP_KEY,
+    const r = await fetch('https://google.serper.dev/shopping', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-KEY': SERPER_KEY,
+      },
+      body: JSON.stringify({
+        q: category,
+        gl: 'us',
+        hl: 'en',
+        num: 40,
+      }),
     })
 
-    const r = await fetch(`https://serpapi.com/search.json?${params}`)
     const data = await r.json()
 
     if (!r.ok || data.error) {
-      console.log(`[FR2] SerpApi error:`, data.error)
-      return res.status(502).json({ error: 'SerpApi search failed', detail: data.error })
+      console.log(`[FR2] Serper error:`, data.error || r.status)
+      return res.status(502).json({ error: 'Serper search failed', detail: data.error || `HTTP ${r.status}` })
     }
 
-    const results = data.shopping_results || []
+    const results = data.shopping || []
     console.log(`[FR3] Got ${results.length} shopping results`)
 
-    // Pick the best product URL per target retailer
-    // We want one real product page per retailer, prioritizing results
-    // with more reviews (more established products = better spec coverage)
+    // Pick one product URL per target retailer
     const found = {}
 
     for (const item of results) {
-      const link = item.link || ''
-      const source = (item.source || '').toLowerCase()
+      // Serper shopping results have: title, source, link, price, imageUrl
+      const rawLink = item.link || ''
+      const source  = (item.source || '').toLowerCase()
+      const directUrl = extractDirectUrl(rawLink) || rawLink
 
       for (const domain of targetRetailers) {
-        if (found[domain]) continue // already found one for this retailer
+        if (found[domain]) continue
 
-        // Match by domain in link URL or source name
         const domainBase = domain.replace('.com', '')
-        if (link.includes(domain) || source.includes(domainBase)) {
-          // Skip marketplace sellers, used/refurbished, and non-product pages
-          if (link.includes('/search') || link.includes('/s?') || link.includes('?k=')) continue
-          if (item.second_hand_condition) continue
+        if (directUrl.includes(domain) || source.includes(domainBase) || source.replace(/\s+/g,'').toLowerCase().includes(domainBase)) {
+          // Skip search pages, non-product pages, used/refurbished
+          if (directUrl.includes('/search') || directUrl.includes('/s?') || directUrl.includes('?k=')) continue
+          if ((item.condition || '').toLowerCase().includes('used')) continue
+          if ((item.condition || '').toLowerCase().includes('refurb')) continue
+
           found[domain] = {
-            retailer: item.source || domainBase.charAt(0).toUpperCase() + domainBase.slice(1),
-            url: link,
+            retailer: item.source || (domainBase.charAt(0).toUpperCase() + domainBase.slice(1)),
+            url: directUrl,
             title: item.title,
             price: item.price,
-            thumbnail: item.thumbnail,
+            thumbnail: item.imageUrl || item.thumbnailUrl || null,
           }
         }
       }
 
-      if (Object.keys(found).length >= 6) break // enough retailers found
+      if (Object.keys(found).length >= 6) break
     }
 
     const retailers = Object.values(found)
-    console.log(`[FR4] Found ${retailers.length} retailers:`, retailers.map(r => r.retailer))
+    console.log(`[FR4] Found ${retailers.length} retailers:`, retailers.map(r => r.retailer).join(', '))
 
     if (retailers.length === 0) {
       return res.status(422).json({
         error: 'No retailer product pages found',
-        detail: `Google Shopping returned ${results.length} results but none matched target retailers`,
+        detail: `Serper returned ${results.length} results but none matched target retailers for "${category}"`,
       })
     }
 
