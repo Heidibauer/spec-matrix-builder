@@ -51,6 +51,7 @@ Rules:
 - importance: "high" = first thing shoppers check, "medium" = important secondary spec, "low" = nice to know
 - Include 15-25 specs total across all groups
 - Focus only on specs that genuinely help someone decide whether to buy this product
+- If dimensions are relevant, list Height, Width, and Depth as three separate specs (do not combine them into one "Dimensions" spec)
 - Do NOT include: price, brand, model number, color options, SKU, or marketing copy
 - Return ONLY the JSON object, nothing else`,
         }],
