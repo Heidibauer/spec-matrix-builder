@@ -74,7 +74,13 @@ Rules:
       return res.status(422).json({ error: 'No JSON returned from Claude' })
     }
 
-    const parsed = JSON.parse(match[0])
+    let parsed
+    try {
+      parsed = JSON.parse(match[0])
+    } catch (e) {
+      console.log('JSON parse error:', e.message, 'text:', match[0].slice(0, 200))
+      return res.status(422).json({ error: 'Claude returned malformed JSON' })
+    }
 
     if (!parsed.groups?.length) {
       return res.status(422).json({ error: 'Empty schema returned' })

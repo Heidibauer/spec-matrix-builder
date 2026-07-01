@@ -73,6 +73,7 @@ export default function Home() {
 
   const [notice, setNotice]       = useState('')
   const [copied, setCopied]       = useState(false)
+  const [findErr, setFindErr]     = useState('')
 
   // ── Generate schema ──────────────────────────────────────────────────────
   async function generateSchema(cat) {
@@ -106,14 +107,17 @@ export default function Home() {
     setLiveMap({ ...liveRef.current })
   }
 
+  const [findErr, setFindErr] = useState('')
+
   async function findAndScrape() {
     const c = category.trim()
     if (!c || !schema) return
     setPhase('finding')
+    setFindErr('')
     liveRef.current = {}
     setLiveMap({})
 
-    // Step 1: SerpApi finds retailer product URLs
+    // Step 1: Serper finds retailer product URLs via site: search
     let retailers = []
     try {
       const r = await fetch('/api/find-retailers', {
@@ -122,11 +126,11 @@ export default function Home() {
         body: JSON.stringify({ category: c }),
       })
       const d = await r.json()
-      if (!r.ok || d.error) throw new Error(d.error)
+      if (!r.ok || d.error) throw new Error(d.detail || d.error || 'Search failed')
       retailers = d.retailers
     } catch (e) {
-      setPhase('done')
-      alert(`Could not find retailers: ${e.message}`)
+      setPhase('error')
+      setFindErr(e.message || 'Could not find retailers')
       return
     }
 
@@ -200,7 +204,7 @@ export default function Home() {
   const hasLive       = doneRetailers.length > 0
   const other         = hasLive ? getOtherSpecs(schema, liveMap) : {}
   const totalSpecs    = schema?.groups?.reduce((n,g) => n+g.specs.length, 0) ?? 0
-  const isRunning     = phase === 'finding' || phase === 'scraping' || schemaLoading
+  const isRunning = phase === 'finding' || phase === 'scraping' || schemaLoading
 
   return (
     <>
@@ -265,12 +269,20 @@ export default function Home() {
         )}
 
         {/* ── Progress ── */}
-        {(phase === 'finding' || (phase === 'scraping' && liveList.length > 0) || phase === 'done') && (
+        {(phase === 'finding' || phase === 'error' || (phase === 'scraping' && liveList.length > 0) || phase === 'done') && (
           <div style={CARD}>
             {phase === 'finding' && (
               <div style={{ display:'flex', alignItems:'center', gap:10, color:'#6b7280', fontSize:14 }}>
-                <div style={{ width:16, height:16, border:'2px solid #e5e7eb', borderTopColor:'#8b5cf6', borderRadius:'50%', animation:'spin .7s linear infinite' }} />
-                Searching Google Shopping for "{category}" retailers…
+                <div style={{ width:16, height:16, border:'2px solid #e5e7eb', borderTopColor:'#8b5cf6', borderRadius:'50%', animation:'spin .7s linear infinite', flexShrink:0 }} />
+                Searching for "{category}" product pages on top retailers…
+              </div>
+            )}
+            {phase === 'error' && (
+              <div>
+                <p style={{ fontSize:13, color:'#ef4444', marginBottom:10 }}>
+                  Could not find retailer pages: {findErr}
+                </p>
+                <button onClick={findAndScrape} style={{ ...BTN_PRIMARY, fontSize:13 }}>Try again →</button>
               </div>
             )}
             {liveList.length > 0 && (
