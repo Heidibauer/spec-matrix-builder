@@ -2,7 +2,7 @@
 // Generates a comprehensive spec schema from Claude's knowledge.
 // Uses tool_use for structured output, with a text fallback.
 
-export const config = { maxDuration: 60 }
+export const config = { maxDuration: 120 }
 
 const TOOL = {
   name: 'schema',
@@ -59,7 +59,7 @@ For each spec include:
 
 Organize into groups: "Capacity & Brewing", "Dimensions & Weight", "Power & Electrical", "Materials & Design", "Included Accessories", "Warranty & Certifications", "Features" (adapt for this category)
 
-Include 25-40 total specs. Be thorough and specific to ${category}.`
+Include 20-25 total specs — the most important ones only. Quality over quantity.`
 
   try {
     // Attempt 1: tool_use for clean structured output
@@ -68,7 +68,7 @@ Include 25-40 total specs. Be thorough and specific to ${category}.`
       headers: { 'Content-Type':'application/json', 'x-api-key':KEY, 'anthropic-version':'2023-06-01' },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
-        max_tokens: 4000,
+        max_tokens: 6000,
         tools: [TOOL],
         tool_choice: { type:'tool', name:'schema' },
         messages: [{ role:'user', content: prompt }],
