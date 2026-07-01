@@ -22,15 +22,15 @@ function fetchWithTimeout(url, opts, ms) {
   return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(t))
 }
 
-async function zyteGet(url, zyteKey, actions = []) {
+async function zyteGet(url, zyteKey, extraActions = []) {
   const body = {
     url,
     browserHtml: true,
     actions: [
-      { type: 'waitForTimeout', timeout: 3000 },
-      { type: 'scrollBottom' },
       { type: 'waitForTimeout', timeout: 2000 },
-      ...actions,
+      { type: 'scrollBottom' },
+      { type: 'waitForTimeout', timeout: 1500 },
+      ...extraActions,
     ],
   }
 
@@ -159,22 +159,15 @@ export default async function handler(req, res) {
 
   console.log(`[SC-3] Pass 1 specs: ${result1?.specs?.length ?? 0}`)
 
-  // Pass 2: If we got fewer than 12 specs, try clicking spec sections
-  // Many sites (Target, Best Buy) hide specs behind tabs/accordions
+  // Pass 2: If we got fewer than 12 specs, try scrolling further down
+  // (some sites lazy-load spec sections below the fold)
   let result = result1
   if ((result1?.specs?.length ?? 0) < 12) {
-    console.log(`[SC-4] Low spec count — running pass 2 with click actions`)
+    console.log(`[SC-4] Low spec count (${result1?.specs?.length ?? 0}) — running pass 2 with deeper scroll`)
     const pass2 = await zyteGet(url, ZYTE_KEY, [
-      // Click common "Specifications" tab/section selectors used by major retailers
-      { type: 'click', selector: { type: 'css', value: '[data-test="specifications-tab"]' } },
-      { type: 'waitForTimeout', timeout: 1500 },
-      { type: 'click', selector: { type: 'css', value: 'button[aria-label*="spec" i]' } },
-      { type: 'waitForTimeout', timeout: 1500 },
-      { type: 'click', selector: { type: 'css', value: '[class*="spec"][class*="tab" i]' } },
-      { type: 'waitForTimeout', timeout: 1500 },
-      { type: 'click', selector: { type: 'css', value: '[class*="specification"]' } },
-      { type: 'waitForTimeout', timeout: 1500 },
-      { type: 'click', selector: { type: 'css', value: 'a[href*="spec"]' } },
+      { type: 'scrollBottom' },
+      { type: 'waitForTimeout', timeout: 2000 },
+      { type: 'scrollBottom' },
       { type: 'waitForTimeout', timeout: 1500 },
     ])
 
