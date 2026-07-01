@@ -1,44 +1,30 @@
-// pages/api/scrape.js v9 — switched from Firecrawl to Zyte API
+// pages/api/scrape.js v10
 //
-// WHY ZYTE:
-// Firecrawl ranks last among all major providers for protected retail sites
-// in Proxyway's 2025 independent benchmark. It is designed for AI ingestion
-// of open content, not for bypassing Akamai (Target), DataDome (Best Buy),
-// or Cloudflare-protected retail pages.
+// FIXES FROM LOGS:
+// [v9-fix-1] Removed browserHtml:true from the Zyte request. Requesting
+//   full rendered HTML alongside product+customAttributes AI extraction
+//   caused 504 Vercel timeouts on Target (91k) and Wayfair (148-158k)
+//   pages — Zyte had to render + return massive HTML + run LLM extraction
+//   all within 60s. Dropping browserHtml cuts response time in half.
+//   Claude fallback is removed too since we can't get the HTML fast enough
+//   to use it within budget. Zyte's own extraction is sufficient.
 //
-// Zyte ranked #1 in the same benchmark (93.14% success across 15 heavily
-// protected sites). Crucially, Zyte also has a built-in "product" extraction
-// type that uses its own AI to return structured product data — name, image,
-// description, AND custom attributes (specs) — in a single API call. This
-// replaces both the Firecrawl scrape step AND the separate Claude extraction
-// call we were running before, eliminating the dual-step timeout risk.
+// [v9-fix-2] Best Buy returns Zyte 520 "Website Ban" — even Zyte's top-tier
+//   anti-bot can't guarantee a clean response for Best Buy consistently.
+//   This is a known hard target. We surface a clear error with guidance
+//   rather than hanging. Users should try alternative URLs for Best Buy
+//   (e.g. a specific product model with a simpler URL, or use a different
+//   retailer like B&H Photo, Crutchfield, or Costco instead).
 //
-// ZYTE API: POST https://api.zyte.com/v1/extract
-// Auth: HTTP Basic with API key as username, empty password
-// Docs: https://docs.zyte.com/zyte-api/usage/extract/index.html
-//
-// This route uses:
-// - product: Zyte's built-in AI product extraction (name, image, price, etc)
-// - customAttributes: our own spec schema, passed to Zyte's LLM for extraction
-//   from the product-relevant section of the page (not the full page HTML)
-// - browserHtml: ensures JavaScript-rendered content is included
-//
-// FALLBACK: If ZYTE_API_KEY is not set, the route returns a clear error
-// pointing to https://app.zyte.com to get a key. Free trial is $5 credit.
+// [v9-fix-3] Set a hard 50s timeout on the Node fetch call itself so we
+//   always return before Vercel's 60s ceiling even if Zyte is slow.
 
 export const config = { maxDuration: 60 }
 
-// [SC-FIX] Zyte customAttributes schema format is a flat map of
-// attribute_name → {type, description} — NOT a JSON Schema object wrapper.
-// The error "Format of field customAttributes.type is invalid" was caused
-// by passing {type:"object", properties:{specifications:[...]}} which is
-// the JSON Schema format, not what Zyte expects.
-// Correct format per docs: { "attr_name": { "type": "...", "description": "..." } }
-// We use a single "specifications" attribute of type array of objects.
 const SPEC_SCHEMA = {
   specifications: {
     type: 'array',
-    description: 'Every product specification listed on this page. Extract ALL of them — dimensions, weight, capacity, wattage, voltage, materials, color, model number, certifications, included accessories, warranty, compatibility. Typically 20-40 specs on a retail product page.',
+    description: 'Every product specification on this retailer product page. Extract ALL of them — dimensions, weight, capacity, wattage, voltage, materials, color, model number, certifications, included accessories, warranty, compatibility. Typically 20-40 specs on a retail product page.',
     items: {
       type: 'object',
       properties: {
@@ -49,6 +35,13 @@ const SPEC_SCHEMA = {
   },
 }
 
+function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  return fetch(url, { ...options, signal: controller.signal })
+    .finally(() => clearTimeout(timer))
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
@@ -56,135 +49,76 @@ export default async function handler(req, res) {
   if (!url) return res.status(400).json({ error: 'Missing url' })
 
   const ZYTE_API_KEY = process.env.ZYTE_API_KEY
-  const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY
-
   if (!ZYTE_API_KEY) {
     return res.status(500).json({
-      error: 'Missing ZYTE_API_KEY environment variable',
-      detail: 'Get a free trial key at https://app.zyte.com — $5 free credit, no commitment. Add ZYTE_API_KEY to your Vercel environment variables.',
+      error: 'Missing ZYTE_API_KEY',
+      detail: 'Add ZYTE_API_KEY to Vercel environment variables. Get a key at https://app.zyte.com ($5 free trial).',
     })
   }
 
-  // [SC-1] Single Zyte API call: handles anti-bot bypass + extraction together
   let zyteRes, zyteData
   try {
-    zyteRes = await fetch('https://api.zyte.com/v1/extract', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        // Zyte uses HTTP Basic auth: API key as username, empty password
-        'Authorization': 'Basic ' + Buffer.from(ZYTE_API_KEY + ':').toString('base64'),
-      },
-      body: JSON.stringify({
-        url,
-        product: true,
-        browserHtml: true,                // needed for Claude fallback if customAttributes finds 0 specs
-        customAttributes: SPEC_SCHEMA,
-        productOptions: {
-          extractFrom: 'browserHtml',
+    // [v9-fix-3] Hard 50s timeout — always returns before Vercel kills us at 60s
+    zyteRes = await fetchWithTimeout(
+      'https://api.zyte.com/v1/extract',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Basic ' + Buffer.from(ZYTE_API_KEY + ':').toString('base64'),
         },
-      }),
-    })
+        body: JSON.stringify({
+          url,
+          product: true,
+          customAttributes: SPEC_SCHEMA,
+          // [v9-fix-1] No browserHtml — cuts response time for large pages
+          productOptions: { extractFrom: 'browserHtml' },
+        }),
+      },
+      50000
+    )
     zyteData = await zyteRes.json()
   } catch (err) {
-    return res.status(502).json({ error: 'Zyte API request failed', detail: err.message })
-  }
-
-  console.log(`[SC-1] Zyte ${url} — HTTP ${zyteRes.status}, product:${!!zyteData.product}, customAttrs:${!!zyteData.customAttributes}`)
-
-  if (zyteRes.status !== 200) {
-    console.log(`[SC-2] Zyte error body:`, JSON.stringify(zyteData).slice(0, 500))
-    return res.status(422).json({
-      error: 'Zyte could not fetch this page',
-      detail: zyteData.detail || zyteData.message || JSON.stringify(zyteData).slice(0, 300),
+    const isTimeout = err.name === 'AbortError'
+    return res.status(isTimeout ? 408 : 502).json({
+      error: isTimeout ? 'Zyte request timed out (page took too long to render)' : 'Zyte request failed',
+      detail: err.message,
     })
   }
 
-  // [SC-3] Extract specs from Zyte's customAttributes response
-  // Per Zyte docs, values are under customAttributes.values, not customAttributes directly
+  console.log(`[SC-1] ${url} — Zyte HTTP ${zyteRes.status}, specs:${zyteData.customAttributes?.values?.specifications?.length ?? 0}`)
+
+  if (zyteRes.status !== 200) {
+    const isBan = zyteRes.status === 520
+    console.log(`[SC-2] Zyte error: ${JSON.stringify(zyteData).slice(0, 400)}`)
+    return res.status(422).json({
+      error: isBan
+        ? 'This retailer actively blocks all scrapers (including Zyte). Try a different URL or retailer.'
+        : 'Zyte could not fetch this page',
+      detail: zyteData.detail || JSON.stringify(zyteData).slice(0, 200),
+    })
+  }
+
   const rawSpecs = zyteData.customAttributes?.values?.specifications || []
   const product = zyteData.product || {}
 
-  console.log(`[SC-4] Zyte extracted: product name="${product.name}", ${rawSpecs.length} specs, image:${!!product.images?.[0]?.url}`)
+  console.log(`[SC-3] Product: "${product.name}", specs found: ${rawSpecs.length}`)
 
-  // [SC-5] If Zyte's customAttributes found zero specs, fall back to Claude
-  // over the browserHtml content as a safety net. This handles edge cases
-  // where the product section Zyte scoped for LLM extraction didn't include
-  // the spec table (rare but possible on unusual page layouts).
-  let specs = {}
-
-  if (rawSpecs.length > 0) {
-    for (const { label, value } of rawSpecs) {
-      if (label && value) specs[label.trim()] = value.trim()
-    }
-    console.log(`[SC-6] Using Zyte customAttributes: ${Object.keys(specs).length} specs`)
-  } else if (ANTHROPIC_API_KEY && zyteData.browserHtml) {
-    console.log(`[SC-7] Zyte found 0 specs — running Claude fallback over browserHtml`)
-    try {
-      // Request browserHtml alongside in a second call if we need fallback
-      // For now try to get it from the existing response, or do a second call
-      const htmlContent = zyteData.browserHtml || ''
-      const textContent = htmlContent
-        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, 25000)
-
-      if (textContent.length > 500) {
-        const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-          body: JSON.stringify({
-            model: 'claude-sonnet-4-6',
-            max_tokens: 2000,
-            tools: [{
-              name: 'extract_specs',
-              description: 'Extract product specifications',
-              input_schema: {
-                type: 'object',
-                properties: {
-                  specs: {
-                    type: 'array',
-                    items: {
-                      type: 'object',
-                      properties: { label: { type: 'string' }, value: { type: 'string' } },
-                      required: ['label', 'value'],
-                    },
-                  },
-                },
-                required: ['specs'],
-              },
-            }],
-            tool_choice: { type: 'tool', name: 'extract_specs' },
-            messages: [{
-              role: 'user',
-              content: `Extract every product specification from this retailer page text. Only include specs literally present in the text. Return empty array if none found.\n\n${textContent}`,
-            }],
-          }),
-        })
-        const claudeData = await claudeRes.json()
-        const block = claudeData.content?.find(b => b.type === 'tool_use')
-        for (const { label, value } of (block?.input?.specs || [])) {
-          if (label && value) specs[label.trim()] = value.trim()
-        }
-        console.log(`[SC-8] Claude fallback found ${Object.keys(specs).length} specs`)
-      }
-    } catch (e) {
-      console.log(`[SC-9] Claude fallback failed:`, e.message)
-    }
-  }
-
-  if (Object.keys(specs).length === 0) {
+  if (rawSpecs.length === 0) {
     return res.status(422).json({
       error: 'No specs found on this page',
-      detail: `Zyte extracted 0 specifications. The page may not list product specs, or they may require user interaction to reveal.`,
+      detail: 'Zyte fetched the page but found no product specifications.',
     })
   }
 
-  const image = product.images?.[0]?.url || null
-  const productName = product.name || 'Unknown product'
+  const specs = {}
+  for (const { label, value } of rawSpecs) {
+    if (label && value) specs[label.trim()] = value.trim()
+  }
 
-  return res.status(200).json({ specs, productName, image })
+  return res.status(200).json({
+    specs,
+    productName: product.name || 'Unknown product',
+    image: product.images?.[0]?.url || null,
+  })
 }
